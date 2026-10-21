@@ -1,12 +1,7 @@
 {
   "name": "parental-control-backend",
   "version": "1.0.0",
-  "description": "Parental Control API - pure Node.js",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  }
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
 }
