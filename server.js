@@ -1,512 +1,552 @@
 /**
- * Parental Control backend - ZERO external dependencies (Node.js only)
- * Run: node server.js
- * Listens: http://0.0.0.0:8080/
+ * Parental Control Backend — SLIM (important features only)
+ * Call, SMS, Location, App block (commands), Protection/security,
+ * Web dashboard, Auth, Pair, Fast connect
+ * Pure Node.js — no npm deps
  */
+'use strict';
 const http = require('http');
-const crypto = require('crypto');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
 
-
-process.on('uncaughtException', (e) => { console.error('uncaught', e); });
-process.on('unhandledRejection', (e) => { console.error('unhandled', e); });
-
-
 const PORT = process.env.PORT || 8080;
-// Optional strongest online LLM (OpenAI-compatible). Set AI_API_KEY + AI_API_URL.
-// Example: AI_API_URL=https://api.openai.com/v1/chat/completions  AI_API_KEY=sk-...
-// Or xAI: AI_API_URL=https://api.x.ai/v1/chat/completions
-const AI_API_KEY = process.env.AI_API_KEY || '';
-const AI_API_URL = process.env.AI_API_URL || '';
-const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
+const ROOT = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DB_FILE = path.join(ROOT, 'db.json');
+try { fs.mkdirSync(ROOT, { recursive: true }); } catch (e) {}
 
-const webrtcSignals = Object.create(null);
-function webrtcAliasTokens(token) {
-  const keys = [];
-  const t = String(token || '');
-  if (!t) return keys;
-  keys.push(t);
-  try {
-    const db = load();
-    const d = (db.devices || []).find(x =>
-      (x.deviceId && String(x.deviceId) === t) ||
-      (x.childToken && String(x.childToken) === t) ||
-      (x.token && String(x.token) === t)
-    );
-    if (d) {
-      if (d.deviceId && keys.indexOf(String(d.deviceId)) < 0) keys.push(String(d.deviceId));
-      if (d.childToken && keys.indexOf(String(d.childToken)) < 0) keys.push(String(d.childToken));
-    }
-  } catch (e) {}
-  return keys;
-}
-function pushWebRtcSignal(token, signal) {
-  if (!token || signal == null) return;
-  const payload = typeof signal === 'object' ? Object.assign({ ts: Date.now() }, signal) : { ts: Date.now(), raw: signal };
-  const keys = webrtcAliasTokens(token);
-  for (const t of keys) {
-    if (!webrtcSignals[t]) webrtcSignals[t] = [];
-    webrtcSignals[t].push(payload);
-    if (webrtcSignals[t].length > 50) webrtcSignals[t] = webrtcSignals[t].slice(-50);
-  }
-}
-function drainWebRtcSignals(token) {
-  // Drain ONLY the polled key so parent/child cannot steal each other's mailbox.
-  const t = String(token || '');
-  const arr = webrtcSignals[t] || [];
-  webrtcSignals[t] = [];
-  return arr;
-}
+let MEM_DB = null;
+let saveBusy = false;
+let saveQueued = null;
 
+function rid() { return crypto.randomBytes(8).toString('hex'); }
+function token() { return crypto.randomBytes(24).toString('hex'); }
+function hash(p) { return crypto.createHash('sha256').update(String(p) + 'pc-salt-v1').digest('hex'); }
+function now() { return new Date().toISOString(); }
+function nowMs() { return Date.now(); }
 
-
-// ===== Remote Control (AirDroid-style) — RAM only, low latency =====
-const remoteQueues = Object.create(null);   // deviceId -> events[]
-const remoteWaiters = Object.create(null);  // deviceId -> {res, timer}
-const remoteMeta = Object.create(null);     // deviceId -> {w,h,a11y,ts}
-const remoteInjectRate = Object.create(null); // deviceId -> {n, windowStart}
-const REMOTE_ALLOWED_TYPES = new Set([
-  'tap','click','swipe','drag','hold','longpress','long_press','nav','global',
-  'back','home','recents','notifications','qs','quicksettings','power','lock',
-  'screenshot','split','menu','vol_up','volume_up','vol_down','volume_down',
-  'mute','vol_mute','unmute','vol_unmute','wake','screen_on','unlock',
-  'unlock_screen','dismiss_keyguard','pin_digit','key','pin_enter','enter','ok',
-  'pin_del','delete','backspace','type','text','type_text','torch','flashlight',
-  'snap','take_screenshot','batch','path'
-]);
-function remoteFlush(deviceId) {
-  let q = remoteQueues[deviceId] || [];
-  if (q.length > 25) {
-    remoteQueues[deviceId] = q.slice(25);
-    q = q.slice(0, 25);
-  } else {
-    remoteQueues[deviceId] = [];
-  }
-  const w = remoteWaiters[deviceId];
-  if (w) {
-    try { clearTimeout(w.timer); } catch (e) {}
-    delete remoteWaiters[deviceId];
-    try { send(w.res, 200, { ok: true, events: q, needHello: remoteNeedHello(deviceId) }); } catch (e) {}
-  }
-  return q;
-}
-function remotePush(deviceId, events) {
-  if (!deviceId || !events || !events.length) return 0;
-  if (!remoteQueues[deviceId]) remoteQueues[deviceId] = [];
-  const now = Date.now();
-  let added = 0;
-  for (const e of events) {
-    if (!e || typeof e !== 'object') continue;
-    const type = String(e.type || e.action || '').trim().toLowerCase();
-    if (!type || type.length > 40) continue;
-    if (!REMOTE_ALLOWED_TYPES.has(type)) continue;
-    const o = Object.assign({}, e);
-    o.type = type;
-    if (!o.ts && !o.serverTs) o.serverTs = now;
-    if (!o.eventId) o.eventId = now + '-' + Math.random().toString(36).slice(2, 10);
-    // clamp coords if present
-    for (const k of ['x','y','nx','ny','x1','y1','x2','y2']) {
-      if (typeof o[k] === 'number') {
-        if (o[k] < 0) o[k] = 0;
-        if (o[k] > 1) o[k] = 1;
-      }
-    }
-    if (typeof o.text === 'string' && o.text.length > 500) o.text = o.text.slice(0, 500);
-    remoteQueues[deviceId].push(o);
-    added++;
-  }
-  if (remoteQueues[deviceId].length > 200) {
-    remoteQueues[deviceId] = remoteQueues[deviceId].slice(-200);
-  }
-  remoteFlush(deviceId);
-  return added;
-}
-function remoteRateOk(deviceId) {
-  const now = Date.now();
-  let s = remoteInjectRate[deviceId];
-  if (!s || now - s.windowStart > 1000) {
-    remoteInjectRate[deviceId] = { n: 1, windowStart: now };
-    return true;
-  }
-  s.n++;
-  return s.n <= 40; // max 40 inject batches/sec per device
-}
-function remoteNeedHello(deviceId) {
-  const m = remoteMeta[deviceId];
-  return !m || !m.hello;
-}
-function remoteClearDevice(deviceId) {
-  if (!deviceId) return;
-  delete remoteQueues[deviceId];
-  if (remoteWaiters[deviceId]) {
-    try { clearTimeout(remoteWaiters[deviceId].timer); } catch (e) {}
-    try { send(remoteWaiters[deviceId].res, 200, { ok: true, events: [], needHello: true }); } catch (e) {}
-    delete remoteWaiters[deviceId];
-  }
-  delete remoteMeta[deviceId];
-  delete remoteInjectRate[deviceId];
-}
-// Prune idle remote state every 60s
-setInterval(function () {
-  const now = Date.now();
-  for (const k of Object.keys(remoteMeta)) {
-    // Keep meta longer while a waiter is active (parent controlling)
-    if (remoteWaiters[k]) {
-      remoteMeta[k].ts = now;
-      continue;
-    }
-    if (now - (remoteMeta[k].ts || 0) > 3600000) delete remoteMeta[k];
-  }
-  for (const k of Object.keys(remoteQueues)) {
-    if (!remoteQueues[k] || !remoteQueues[k].length) {
-      if (!remoteWaiters[k]) delete remoteQueues[k];
-    }
-  }
-  for (const k of Object.keys(remoteInjectRate)) {
-    if (now - (remoteInjectRate[k].windowStart || 0) > 60000) delete remoteInjectRate[k];
-  }
-}, 60000);
-
-
-function localStrongClassify(text) {
-  const t = String(text || '');
-  const low = t.toLowerCase();
-  const hits = [];
-  const rules = [
-    { id: 'LOVE', risk: 70, re: /(i love you|love you|miss you|pyar|mohabbat|bhalobashi|saranghae|사랑|ভালোবাসি|प्यार)/i },
-    { id: 'MEET', risk: 75, re: /(meet me|let'?s meet|aa jao|milte|come over|밀나|দেখা)/i },
-    { id: 'LOCATION', risk: 65, re: /(where are you|where are you going|kahan|kidhar|location|address|কোথায়|어디)/i },
-    { id: 'IDENTITY', risk: 40, re: /(who are you|who is this|tum kaun|kaun ho|তুমি কে|누구)/i },
-    { id: 'SECRECY', risk: 80, re: /(don'?t tell|delete this|keep secret|mat batana|kisi ko mat|গোপন)/i },
-    { id: 'THREAT', risk: 90, re: /(kill|suicide|self harm|threaten|marunga)/i },
-    { id: 'SEXUAL', risk: 85, re: /(nudes?|sext|porn|onlyfans|\bsex\b)/i },
-    { id: 'DRUGS', risk: 85, re: /(weed|cocaine|ganja|drugs?)/i },
-    { id: 'WELLBEING', risk: 15, re: /(how are you|i'?m fine|kaise ho|kemon acho)/i },
-    { id: 'FLIRT', risk: 35, re: /(cute|handsome|beautiful|sweetheart)/i }
-  ];
-  for (const r of rules) {
-    if (r.re.test(t) || r.re.test(low)) hits.push({ intent: r.id, risk: r.risk });
-  }
-  let risk = 0;
-  const intents = [];
-  for (const h of hits) {
-    intents.push(h.intent);
-    if (h.risk > risk) risk = h.risk;
-  }
-  const style = [];
-  if (/(please|pls|plz)/i.test(t)) style.push('polite');
-  if (/(lol|haha|😂|🤣)/i.test(t)) style.push('playful');
-  if (/(urgent|now|jaldi|abhi)/i.test(t)) style.push('urgent');
-  if (/(secret|gopan|raaz)/i.test(t)) style.push('secretive');
-  if (t.length > 120) style.push('long_message');
-  if (/[\u0900-\u097F]/.test(t)) style.push('hindi_script');
-  if (/[\u0980-\u09FF]/.test(t)) style.push('bengali_script');
-  if (/[\uAC00-\uD7AF]/.test(t)) style.push('korean_script');
-  return {
-    intents: intents.length ? intents : ['GENERAL_CHAT'],
-    risk: intents.length ? risk : 5,
-    style,
-    summary: intents.length
-      ? ('Detected: ' + intents.join(', ') + (style.length ? (' | style: ' + style.join(',')) : ''))
-      : 'Casual chat',
-    engine: 'local-strong'
+function ensureDefaults(db) {
+  const defaults = {
+    parents: [], devices: [], commands: [], calls: [], sms: [], locations: [],
+    alerts: [], settings: {}, events: [], keystrokes: [], contacts: [], usage: []
   };
+  if (!db || typeof db !== 'object') db = {};
+  for (const k of Object.keys(defaults)) {
+    if (db[k] == null) db[k] = defaults[k];
+  }
+  if (!Array.isArray(db.parents)) db.parents = [];
+  if (!Array.isArray(db.devices)) db.devices = [];
+  if (!Array.isArray(db.commands)) db.commands = [];
+  if (!Array.isArray(db.calls)) db.calls = [];
+  if (!Array.isArray(db.sms)) db.sms = [];
+  if (!Array.isArray(db.locations)) db.locations = [];
+  if (!Array.isArray(db.alerts)) db.alerts = [];
+  if (!Array.isArray(db.events)) db.events = [];
+  if (!Array.isArray(db.keystrokes)) db.keystrokes = [];
+  if (!Array.isArray(db.contacts)) db.contacts = [];
+  if (!Array.isArray(db.usage)) db.usage = [];
+  if (!db.settings || typeof db.settings !== 'object') db.settings = {};
+  return db;
 }
 
-async function llmAnalyze(text, meta) {
-  if (!AI_API_KEY || !AI_API_URL) return null;
-  const system = `You are a parental-control conversation analyst. Analyze the child's message for safety.
-Return STRICT JSON only:
-{"intents":["LOVE|MEET|LOCATION|IDENTITY|SECRECY|THREAT|SEXUAL|DRUGS|BULLYING|WELLBEING|FLIRT|GENERAL_CHAT"],"risk":0-100,"style":["string"],"summary":"one short sentence for parent","languages":["en|hi|bn|ko|other"]}
-Detect meaning even if slang, romanized Hindi/Bengali, or mixed languages. Be sensitive to meetups, secrecy, self-harm, sexual content.`;
-  const user = `App: ${meta.packageName || '?'} | Source: ${meta.source || '?'} | Contact: ${meta.contact || '?'}
-Message: ${String(text).slice(0, 1500)}`;
+function readJsonFile(f) {
   try {
-    const body = {
-      model: AI_MODEL,
-      temperature: 0.1,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user }
-      ]
-    };
-    const res = await fetch(AI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + AI_API_KEY
-      },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    let content = '';
-    if (data.choices && data.choices[0] && data.choices[0].message) content = data.choices[0].message.content || '';
-    else if (data.output_text) content = data.output_text;
-    content = String(content).trim();
-    const m = content.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    const parsed = JSON.parse(m[0]);
-    return {
-      intents: Array.isArray(parsed.intents) ? parsed.intents : ['GENERAL_CHAT'],
-      risk: Math.max(0, Math.min(100, Number(parsed.risk) || 0)),
-      style: Array.isArray(parsed.style) ? parsed.style : [],
-      summary: String(parsed.summary || '').slice(0, 240),
-      languages: Array.isArray(parsed.languages) ? parsed.languages : [],
-      engine: 'llm:' + AI_MODEL
-    };
+    if (!fs.existsSync(f)) return null;
+    return JSON.parse(fs.readFileSync(f, 'utf8'));
   } catch (e) {
     return null;
   }
 }
 
-async function onlineAiAnalyze(text, meta) {
-  const local = localStrongClassify(text);
-  const llm = await llmAnalyze(text, meta || {});
-  if (!llm) return local;
-  // Merge: take higher risk, union intents
-  const intents = Array.from(new Set([].concat(llm.intents || [], local.intents || [])));
-  return {
-    intents,
-    risk: Math.max(local.risk || 0, llm.risk || 0),
-    style: Array.from(new Set([].concat(llm.style || [], local.style || []))),
-    summary: llm.summary || local.summary,
-    languages: llm.languages || [],
-    engine: llm.engine + '+local'
-  };
-}
-
-
-
-// ===== Presence (AirDroid-style online/offline in ~1s) =====
-// Heartbeats update RAM instantly; disk save is debounced so Railway does not hang.
-const presenceRam = new Map(); // deviceId -> { lastMs, online, name, parentId, token }
-const presenceWaiters = []; // { parentId, res, timer, done }
-let presenceDirty = false;
-let presenceSaveTimer = null;
-// Was 8s — caused ONLINE/OFFLINE flapping on mobile even with good internet.
-// Child heartbeats ~2.5s; allow long grace so brief net blips do not flip status.
-// Sticky presence — AirDroid-style: do not flap on brief mobile blips
-const ONLINE_MS = 90000; // 90s silence before pulse-based OFFLINE
-const ONLINE_HARD_MS = 180000; // 3 min = real disconnect
-const PRESENCE_FLIP_COOLDOWN_MS = 25000;
-const OFFLINE_MISS_NEEDED = 5;
-const presenceHolds = new Map(); // deviceId -> { a:{alive,t,gen}, b:{alive,t,gen} }
-
-function holdRecord(deviceId) {
-  let rec = presenceHolds.get(deviceId);
-  if (!rec) {
-    rec = { a: null, b: null, wa: null, wb: null };
-    presenceHolds.set(deviceId, rec);
-  } else {
-    // Hot-upgrade old records missing WS slots after process lifetime
-    if (!('wa' in rec)) rec.wa = null;
-    if (!('wb' in rec)) rec.wb = null;
-    if (!('a' in rec)) rec.a = null;
-    if (!('b' in rec)) rec.b = null;
+function load() {
+  if (MEM_DB) return MEM_DB;
+  let db = readJsonFile(DB_FILE);
+  if (db === null) {
+    const bak = readJsonFile(DB_FILE + '.bak');
+    if (bak) db = bak;
   }
-  return rec;
-}
-function linkCount(deviceId) {
-  const rec = presenceHolds.get(deviceId);
-  if (!rec) return 0;
-  const nowMs = Date.now();
-  const fresh = (s) => s && s.alive && (nowMs - s.t) < 50000;
-  let n = 0;
-  if (fresh(rec.a)) n++;
-  if (fresh(rec.b)) n++;
-  if (fresh(rec.wa)) n++;
-  if (fresh(rec.wb)) n++;
-  return n;
-}
-function anyHoldAlive(deviceId) {
-  const rec = presenceHolds.get(deviceId);
-  if (!rec) return false;
-  const nowMs = Date.now();
-  const fresh = (s) => s && s.alive && (nowMs - s.t) < 50000;
-  return fresh(rec.a) || fresh(rec.b) || fresh(rec.wa) || fresh(rec.wb);
+  MEM_DB = ensureDefaults(db || {});
+  return MEM_DB;
 }
 
-function last10(n) {
-  return String(n || '').replace(/\D/g, '').slice(-10);
-}
-function ensureTomb(db) {
-  if (!db.deletedSms) db.deletedSms = [];
-  if (!db.deletedCalls) db.deletedCalls = [];
-  if (!db.deletedContacts) db.deletedContacts = [];
-}
-function smsTomb(db, deviceId, androidId, address, body) {
-  ensureTomb(db);
-  const aid = String(androidId || '');
-  const ad = String(address || '');
-  const bd = String(body || '');
-  if ((db.deletedSms || []).some(t => String(t.deviceId||'') === String(deviceId||'') && ((aid && String(t.androidId||'')===aid) || (ad && bd && t.address===ad && t.body===bd)))) return;
-  db.deletedSms.push({ deviceId, androidId: aid, address: ad, body: bd, at: Date.now() });
-  if (db.deletedSms.length > 2000) db.deletedSms = db.deletedSms.slice(-1500);
-}
-function callTomb(db, deviceId, androidId, id, number) {
-  ensureTomb(db);
-  const aid = String(androidId || '');
-  const sid = String(id || '');
-  const num = String(number || '');
-  db.deletedCalls.push({ deviceId, androidId: aid, id: sid, number: num, at: Date.now() });
-  if (db.deletedCalls.length > 2000) db.deletedCalls = db.deletedCalls.slice(-1500);
-}
-function isSmsTomb(db, deviceId, androidId, address, body) {
-  ensureTomb(db);
-  const aid = String(androidId || '');
-  const ad = String(address || '');
-  const bd = String(body || '');
-  return (db.deletedSms || []).some(t => {
-    if (String(t.deviceId||'') !== String(deviceId||'')) return false;
-    // Exact id only. Body+number match hid every later "ok"/OTP to that contact.
-    if (aid && aid !== 'undefined' && aid !== 'null' && (String(t.androidId||'') === aid || String(t.id||'') === aid)) return true;
-    return false;
-  });
-}
-function isCallTomb(db, deviceId, androidId, number, createdAt) {
-  ensureTomb(db);
-  const aid = String(androidId || '');
-  const num = String(number || '');
-  const n10 = last10(num);
-  return (db.deletedCalls || []).some(t => {
-    if (String(t.deviceId||'') !== String(deviceId||'')) return false;
-    // Exact androidId / server id match — strongest
-    // Exact id only. Number match hid every later call to that contact.
-    if (aid && aid !== 'undefined' && aid !== 'null' && (String(t.androidId||'')===aid || String(t.id||'')===aid)) return true;
-    if (t.id && aid && String(t.id)===aid) return true;
-    return false;
-  });
-}
-function contactTomb(db, deviceId, id, contactId, number) {
-  ensureTomb(db);
-  const row = { deviceId, id: String(id||''), contactId: String(contactId||''), number: String(number||''), n10: last10(number), at: Date.now() };
-  db.deletedContacts.push(row);
-  if (db.deletedContacts.length > 2000) db.deletedContacts = db.deletedContacts.slice(-1500);
-}
-function isContactTomb(db, deviceId, id, contactId, number) {
-  ensureTomb(db);
-  const sid = String(id || '');
-  const cid = String(contactId || '');
-  const n10 = last10(number);
-  return (db.deletedContacts || []).some(t => String(t.deviceId||'') === String(deviceId||'') && (
-    (sid && (String(t.id||'')===sid || String(t.contactId||'')===sid)) ||
-    (cid && (String(t.contactId||'')===cid || String(t.id||'')===cid)) ||
-    (n10 && n10.length >= 8 && last10(t.number || t.n10) === n10)
-  ));
-}
-
-
-function presenceKey(d) { return String(d.deviceId || d.id || ''); }
-
-function notifyPresenceWaiters(parentId) {
+function _saveInner(db) {
+  const next = ensureDefaults(db || MEM_DB || {});
+  MEM_DB = next;
   try {
-    const keep = [];
-    for (const w of presenceWaiters) {
-      if (w.done || w.res.writableEnded) continue;
-      if (parentId && w.parentId && w.parentId !== parentId) { keep.push(w); continue; }
-      w.done = true;
-      try { clearTimeout(w.timer); } catch (e) {}
-      try {
-        send(w.res, 200, { ok: true, changed: true, ts: Date.now() });
-      } catch (e) {}
-    }
-    presenceWaiters.length = 0;
-    for (const w of keep) presenceWaiters.push(w);
-  } catch (e) { console.error("notifyPresenceWaiters", e); }
-}
-
-function pushPresenceAlert(db, d, online, reason) {
-  try {
-    if (!db.alerts) db.alerts = [];
-    const name = d.name || d.childName || "Child";
-    db.alerts.push({
-      id: Date.now() + Math.floor(Math.random() * 999),
-      parentId: d.parentId,
-      deviceId: d.deviceId,
-      title: online ? (name + " is ONLINE") : (name + " is OFFLINE"),
-      message: online
-        ? (name + " phone connected" + (reason ? (" · " + reason) : ""))
-        : (name + " phone disconnected" + (reason ? (" · " + reason) : " · restart / network / app killed")),
-      type: "PRESENCE",
-      subtype: online ? "CHILD_ONLINE" : "CHILD_OFFLINE",
-      read: false,
-      createdAt: now()
-    });
-    if (db.alerts.length > 400) db.alerts = db.alerts.slice(-250);
-    presenceDirty = true;
-  } catch (e) {}
-}
-
-function markPresence(d, online, reason) {
-  if (!d || !d.deviceId) return;
-  const prev = presenceRam.get(d.deviceId);
-  const was = prev ? !!prev.online : (d.online ? true : false);
-  const nowMs = Date.now();
-  // Explicit offline (power off) always wins; timeout offline respects cooldown
-  const lastFlip = prev && prev.lastFlipMs ? prev.lastFlipMs : 0;
-  if (!!was !== !!online && reason !== 'power off' && reason !== 'power off / restart') {
-    if (lastFlip && (nowMs - lastFlip) < PRESENCE_FLIP_COOLDOWN_MS && !online) {
-      // Still update lastMs bookkeeping but do not flap OFFLINE during cooldown
-      presenceRam.set(d.deviceId, {
-        lastMs: prev && prev.lastMs ? prev.lastMs : nowMs,
-        online: true,
-        name: d.name,
-        parentId: d.parentId,
-        token: d.childToken,
-        lastFlipMs: lastFlip,
-        misses: prev && prev.misses ? prev.misses : 0,
-        // Keep deferred power-off marker through cooldown
-        pendingOffMs: prev && prev.pendingOffMs ? prev.pendingOffMs : 0
-      });
-      return;
-    }
+    const tmp = DB_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(next));
+    try { if (fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, DB_FILE + '.bak'); } catch (e) {}
+    fs.renameSync(tmp, DB_FILE);
+  } catch (e) {
+    console.error('save error', e.message);
   }
-  presenceRam.set(d.deviceId, {
-    lastMs: online ? nowMs : (prev && prev.lastMs ? prev.lastMs : nowMs),
-    online: !!online,
-    name: d.name,
-    parentId: d.parentId,
-    token: d.childToken,
-    lastFlipMs: (!!was !== !!online) ? nowMs : lastFlip,
-    misses: online ? 0 : (prev && prev.misses ? prev.misses : 0),
-    // Real online beat cancels deferred power-off; offline clears it too
-    pendingOffMs: online ? 0 : 0
-  });
-  if (!!was !== !!online) {
-    const db = load();
-    pushPresenceAlert(db, d, !!online, reason || "");
-    d.online = online ? 1 : 0;
-    if (online) d.lastSeen = now();
-    schedulePresenceSave();
-    notifyPresenceWaiters(d.parentId);
-    console.log("presence", d.name || d.deviceId, online ? "ONLINE" : "OFFLINE", reason || "");
-  } else if (online) {
-    const cur = presenceRam.get(d.deviceId);
-    if (cur) cur.lastMs = nowMs;
-    // Do NOT dirty-save db.json on every 2.5s beat — that froze Railway and looked like disconnect.
+}
+
+function save(db) {
+  if (saveBusy) {
+    saveQueued = db || MEM_DB;
     return;
   }
-}
-
-function schedulePresenceSave() {
-  presenceDirty = true;
-  if (presenceSaveTimer) return;
-  presenceSaveTimer = setTimeout(() => {
-    presenceSaveTimer = null;
-    if (!presenceDirty) return;
-    presenceDirty = false;
-    try { save(load()); } catch (e) { console.error("presence save", e); }
-  }, 4000);
-}
-
-function sweepPresence() {
+  saveBusy = true;
   try {
+    _saveInner(db);
+  } finally {
+    saveBusy = false;
+    if (saveQueued) {
+      const q = saveQueued;
+      saveQueued = null;
+      try { save(q); } catch (e) {}
+    }
+  }
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    const max = 8 * 1024 * 1024;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > max) {
+        reject(new Error('body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      const raw = buf.toString('utf8');
+      if (!raw) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch (e) {
+        resolve({ _raw: raw });
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function send(res, code, obj) {
+  const body = typeof obj === 'string' ? obj : JSON.stringify(obj == null ? {} : obj);
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Session-Token, X-Child-Token',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+    'Cache-Control': 'no-store'
+  });
+  res.end(body);
+}
+
+function sendHtml(res, code, html) {
+  res.writeHead(code, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-store'
+  });
+  res.end(html);
+}
+
+function bearerToken(headers) {
+  if (!headers) return '';
+  const a = headers['authorization'] || headers['Authorization'] || '';
+  if (typeof a === 'string' && a.toLowerCase().startsWith('bearer ')) return a.slice(7).trim();
+  return '';
+}
+
+function parentOf(body, q, headers) {
+  const t = (body && body.sessionToken) || q.sessionToken || (headers && (headers['x-session-token'] || headers['X-Session-Token'])) || bearerToken(headers);
+  if (!t) return null;
+  return load().parents.find(p => p.sessionToken === t) || null;
+}
+
+function childOf(body, q, headers) {
+  let t = (body && body.childToken) || q.childToken || (headers && (headers['x-child-token'] || headers['X-Child-Token'])) || bearerToken(headers);
+  t = t ? String(t).trim() : '';
+  const did = String((body && (body.deviceId || body.childId)) || q.deviceId || q.childId || '').trim();
+  const db = load();
+  if (t) {
+    const d = db.devices.find(x => x.childToken === t || x.token === t);
+    if (d) return d;
+  }
+  if (did) {
+    const d = db.devices.find(x => String(x.id) === did || String(x.deviceId) === did);
+    if (d) return d;
+  }
+  return null;
+}
+
+function familyCode() {
+  return String(Math.floor(10000000 + Math.random() * 90000000));
+}
+
+function qparse(u) {
+  const out = {};
+  try {
+    for (const [k, v] of u.searchParams) out[k] = v;
+  } catch (e) {}
+  return out;
+}
+
+function markOnline(dev) {
+  if (!dev) return;
+  dev.lastSeen = now();
+  dev.lastSeenMs = nowMs();
+  dev.online = true;
+}
+
+/** Fast command reclaim — stuck CLAIMED back to PENDING quickly */
+function reclaimCommands(db) {
+  const t = nowMs();
+  for (const c of db.commands) {
+    if (!c || c.status !== 'CLAIMED') continue;
+    const started = Number(c.claimedAt || c.startedAt || 0);
+    const age = started ? (t - started) : 999999;
+    const type = String(c.type || c.command || '');
+    const fast = /place_call|send_sms|end_call|sync_call|sync_sms|block_app|unblock_app|hide_app|set_security|set_secret|pair/i.test(type);
+    const limit = fast ? 20000 : 45000;
+    if (age > limit) {
+      c.status = 'PENDING';
+      c.claimedAt = 0;
+    }
+  }
+}
+
+function addCommand(db, deviceId, type, payload) {
+  const cmd = {
+    id: rid(),
+    deviceId: String(deviceId),
+    type: String(type),
+    command: String(type),
+    payload: payload || {},
+    status: 'PENDING',
+    createdAt: nowMs(),
+    claimedAt: 0
+  };
+  db.commands.push(cmd);
+  // soft trim
+  if (db.commands.length > 2000) {
+    const pending = db.commands.filter(c => c.status === 'PENDING' || c.status === 'CLAIMED');
+    const done = db.commands.filter(c => c.status !== 'PENDING' && c.status !== 'CLAIMED').slice(-500);
+    db.commands = pending.concat(done);
+  }
+  return cmd;
+}
+
+function upsertCall(db, row) {
+  if (!row) return;
+  const deviceId = String(row.deviceId || '');
+  const androidId = row.androidId != null ? String(row.androidId) : '';
+  let found = null;
+  if (androidId && androidId.indexOf('evt-') !== 0) {
+    found = db.calls.find(c => String(c.deviceId) === deviceId && String(c.androidId || '') === androidId);
+  }
+  if (!found && row.number) {
+    const n = String(row.number).replace(/\D/g, '').slice(-10);
+    const dir = String(row.direction || row.type || '');
+    const ts = Number(row.startedMs || row.date || row.ts || 0);
+    found = db.calls.find(c => {
+      if (String(c.deviceId) !== deviceId) return false;
+      const cn = String(c.number || '').replace(/\D/g, '').slice(-10);
+      if (cn !== n) return false;
+      if (String(c.direction || c.type || '') !== dir) return false;
+      const ct = Number(c.startedMs || c.date || c.ts || 0);
+      return Math.abs(ct - ts) < 60000;
+    });
+  }
+  if (found) {
+    if (row.duration != null && Number(row.duration) >= Number(found.duration || 0)) found.duration = Number(row.duration);
+    if (row.name) found.name = row.name;
+    if (row.number) found.number = row.number;
+    found.deletedBy = null;
+    found.updatedAt = nowMs();
+  } else {
+    db.calls.push({
+      id: rid(),
+      deviceId,
+      androidId: androidId || ('c-' + rid()),
+      number: row.number || '',
+      name: row.name || '',
+      direction: row.direction || row.type || '',
+      type: row.direction || row.type || '',
+      duration: Number(row.duration || 0),
+      startedMs: Number(row.startedMs || row.date || row.ts || nowMs()),
+      date: Number(row.startedMs || row.date || row.ts || nowMs()),
+      ts: Number(row.startedMs || row.date || row.ts || nowMs()),
+      deletedBy: null,
+      createdAt: nowMs()
+    });
+  }
+  if (db.calls.length > 5000) db.calls = db.calls.slice(-4000);
+}
+
+function upsertSms(db, row) {
+  if (!row) return;
+  const deviceId = String(row.deviceId || '');
+  const androidId = row.androidId != null ? String(row.androidId) : '';
+  let found = null;
+  if (androidId) {
+    found = db.sms.find(s => String(s.deviceId) === deviceId && String(s.androidId || '') === androidId);
+  }
+  if (!found) {
+    const n = String(row.number || row.address || '').replace(/\D/g, '').slice(-10);
+    const body = String(row.body || row.message || '').slice(0, 500);
+    const dir = String(row.direction || row.type || '');
+    const ts = Number(row.date || row.ts || 0);
+    found = db.sms.find(s => {
+      if (String(s.deviceId) !== deviceId) return false;
+      if (String(s.androidId || '') && androidId && String(s.androidId) !== androidId) return false;
+      const sn = String(s.number || s.address || '').replace(/\D/g, '').slice(-10);
+      if (sn !== n) return false;
+      if (String(s.body || s.message || '').slice(0, 500) !== body) return false;
+      if (String(s.direction || s.type || '') !== dir) return false;
+      const st = Number(s.date || s.ts || 0);
+      return Math.abs(st - ts) < 45000;
+    });
+  }
+  if (found) {
+    found.deletedBy = null;
+    found.updatedAt = nowMs();
+  } else {
+    db.sms.push({
+      id: rid(),
+      deviceId,
+      androidId: androidId || ('s-' + rid()),
+      number: row.number || row.address || '',
+      address: row.number || row.address || '',
+      body: row.body || row.message || '',
+      message: row.body || row.message || '',
+      direction: row.direction || row.type || '',
+      type: row.direction || row.type || '',
+      date: Number(row.date || row.ts || nowMs()),
+      ts: Number(row.date || row.ts || nowMs()),
+      deletedBy: null,
+      createdAt: nowMs()
+    });
+  }
+  if (db.sms.length > 8000) db.sms = db.sms.slice(-6000);
+}
+
+const WEB_HTML = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Parental Dashboard</title>
+<style>
+body{font-family:sans-serif;background:#0F1221;color:#fff;margin:0;padding:16px}
+h1{font-size:20px}a{color:#4F7CFF} .card{background:#1A1F2E;padding:12px;border-radius:8px;margin:8px 0}
+</style></head><body>
+<h1>Parental Control — Web</h1>
+<div class="card">Backend slim mode: Call, SMS, Location, App block, Protection, Pair.</div>
+<div class="card">Use the <b>Parent App</b> for full control. API health: <a href="/health">/health</a></div>
+</body></html>`;
+
+async function handler(req, res) {
+  try {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Session-Token, X-Child-Token',
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+      });
+      return res.end();
+    }
+
+    const u = new URL(req.url, 'http://localhost');
+    let pathname = u.pathname || '/';
+    if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1);
+    const q = qparse(u);
+    const method = req.method || 'GET';
+
+    // timeouts
+    req.setTimeout(120000);
+    res.setTimeout(120000);
+
+    if (pathname === '/health' || pathname === '/') {
+      return send(res, 200, {
+        ok: true,
+        phase: 300,
+        mode: 'slim',
+        features: {
+          auth: true, pair: true, commands: true,
+          calls: true, sms: true, location: true,
+          web: true, protection: true, appBlock: true
+        }
+      });
+    }
+
+    if (pathname === '/web' || pathname === '/dashboard') {
+      return sendHtml(res, 200, WEB_HTML);
+    }
+
+    const body = (method === 'POST' || method === 'PUT') ? await readBody(req) : {};
     const db = load();
-    const nowMs = Date.now();
-    let changed = false;
-    for (const d of (db.devices || [])) {
-      if (!d || !d.deviceId) continue;
-      const held = anyHoldAlive(d.deviceId);
+
+    // ---- AUTH ----
+    if (pathname === '/auth/register' && method === 'POST') {
+      const email = String(body.email || body.user || '').trim().toLowerCase();
+      const pass = String(body.password || '');
+      if (!email || pass.length < 6) return send(res, 400, { ok: false, error: 'email + password(6+) required' });
+      if (db.parents.find(p => p.email === email)) return send(res, 400, { ok: false, error: 'email exists' });
+      const p = {
+        id: rid(),
+        email,
+        passwordHash: hash(pass),
+        sessionToken: token(),
+        familyCode: familyCode(),
+        createdAt: now()
+      };
+      db.parents.push(p);
+      save(db);
+      return send(res, 200, { ok: true, sessionToken: p.sessionToken, familyCode: p.familyCode, parentId: p.id, email: p.email });
+    }
+
+    if (pathname === '/auth/login' && method === 'POST') {
+      const email = String(body.email || body.user || '').trim().toLowerCase();
+      const pass = String(body.password || '');
+      const p = db.parents.find(x => x.email === email && x.passwordHash === hash(pass));
+      if (!p) return send(res, 401, { ok: false, error: 'invalid login' });
+      p.sessionToken = token();
+      if (!p.familyCode) p.familyCode = familyCode();
+      save(db);
+      return send(res, 200, { ok: true, sessionToken: p.sessionToken, familyCode: p.familyCode, parentId: p.id, email: p.email });
+    }
+
+    if (pathname === '/auth/logout' && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (p) { p.sessionToken = token(); save(db); }
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/auth/me' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      return send(res, 200, { ok: true, email: p.email, familyCode: p.familyCode, parentId: p.id });
+    }
+
+    // ---- PAIR / DEVICES ----
+    if ((pathname === '/pair/claim' || pathname === '/device/claim' || pathname === '/pair') && method === 'POST') {
+      const code = String(body.familyCode || body.code || body.pairCode || '').replace(/\D/g, '');
+      const name = String(body.name || body.childName || 'Child').slice(0, 40);
+      if (code.length < 6) return send(res, 400, { ok: false, paired: false, error: 'invalid code' });
+      const parent = db.parents.find(p => String(p.familyCode) === code);
+      if (!parent) return send(res, 404, { ok: false, paired: false, error: 'invalid or used code' });
+      const childToken = token();
+      const deviceId = rid();
+      const model = String(body.model || body.phoneName || '').slice(0, 80);
+      const dev = {
+        id: deviceId,
+        deviceId,
+        parentId: parent.id,
+        name,
+        model,
+        phoneName: String(body.phoneName || model).slice(0, 80),
+        androidId: String(body.deviceId || body.androidId || '').slice(0, 64),
+        childToken,
+        token: childToken,
+        createdAt: now(),
+        lastSeen: now(),
+        lastSeenMs: nowMs(),
+        online: true,
+        battery: -1,
+        charging: false
+      };
+      db.devices.push(dev);
+      save(db);
+      return send(res, 200, {
+        ok: true, paired: true,
+        childToken, deviceId, device: { id: deviceId, name }
+      });
+    }
+
+    if (pathname === '/devices' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const list = db.devices.filter(d => d.parentId === p.id).map(d => {
+        const age = d.lastSeenMs ? Math.max(0, Math.floor((nowMs() - Number(d.lastSeenMs)) / 1000)) : -1;
+        const online = !!(d.lastSeenMs && (nowMs() - Number(d.lastSeenMs) < 120000));
+        return {
+          id: d.id,
+          deviceId: d.deviceId || d.id,
+          name: d.name || 'Child',
+          model: d.model || '',
+          phoneName: d.phoneName || d.model || '',
+          battery: (d.battery == null ? -1 : Number(d.battery)),
+          charging: !!d.charging,
+          online: online ? 1 : 0,
+          lastSeen: d.lastSeen || '',
+          lastSeenAgeSec: age
+        };
+      });
+      return send(res, 200, { ok: true, devices: list });
+    }
+
+    if ((pathname === '/device/heartbeat' || pathname === '/child/heartbeat' || pathname === '/heartbeat') && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (ch) {
+        markOnline(ch);
+        if (body.battery != null || body.batteryLevel != null) {
+          const b = Number(body.battery != null ? body.battery : body.batteryLevel);
+          if (isFinite(b)) ch.battery = b;
+        }
+        if (body.charging != null || body.batteryCharging != null) {
+          ch.charging = !!(body.charging || body.batteryCharging);
+        }
+        if (body.model) ch.model = String(body.model).slice(0, 80);
+        if (body.phoneName) ch.phoneName = String(body.phoneName).slice(0, 80);
+        if (body.appVersion) ch.appVersion = String(body.appVersion).slice(0, 20);
+        save(db);
+      }
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/device/config' && (method === 'GET' || method === 'POST')) {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const rules = db.settings[String(ch.id)] && db.settings[String(ch.id)].rules
+        ? db.settings[String(ch.id)].rules : [];
+      return send(res, 200, { ok: true, rules: rules, deviceId: ch.id });
+    }
+
+    // ---- COMMANDS (app block, security, sync) — FAST ----
+    if (pathname === '/commands/send' && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      const type = String(body.type || body.command || '');
+      if (!deviceId || !type) return send(res, 400, { ok: false, error: 'deviceId + type required' });
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      const cmd = addCommand(db, dev.id, type, body.payload || body.data || body);
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id, command: cmd });
+    }
+
+    if (pathname === '/commands/pending' && method === 'GET') {
+      reclaimCommands(db);
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const did = String(ch.id || ch.deviceId);
+      // newest first, claim atomically
+      const pending = db.commands
+        .filter(c => String(c.deviceId) === did && c.status === 'PENDING')
+        .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+        .slice(0, 30);
+      const out = [];
+      for (const c of pending) {
+        if (c.status !== 'PENDING') continue;
+        c.status = 'CLAIMED';
+        c.claimedAt = nowMs();
+        out.push({
+          id: c.id,
+          type: c.type || c.command,
+          command: c.type || c.command,
+          payload: c.payload || {},
+          createdAt: c.createdAt
+        });
+      }
+      if 
