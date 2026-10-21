@@ -12,10 +12,13 @@ const path = require('path');
 const crypto = require('crypto');
 const { URL } = require('url');
 
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT) || 8080;
+const HOST = process.env.HOST || '0.0.0.0';
 const ROOT = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = path.join(ROOT, 'db.json');
-try { fs.mkdirSync(ROOT, { recursive: true }); } catch (e) {}
+try { fs.mkdirSync(ROOT, { recursive: true }); } catch (e) {
+  console.error('mkdir data failed', e && e.message);
+}
 
 let MEM_DB = null;
 let saveBusy = false;
@@ -74,13 +77,25 @@ function load() {
 function _saveInner(db) {
   const next = ensureDefaults(db || MEM_DB || {});
   MEM_DB = next;
+  const json = JSON.stringify(next);
   try {
     const tmp = DB_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(next));
+    fs.writeFileSync(tmp, json);
     try { if (fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, DB_FILE + '.bak'); } catch (e) {}
-    fs.renameSync(tmp, DB_FILE);
+    try {
+      fs.renameSync(tmp, DB_FILE);
+    } catch (e) {
+      // Railway / some FS: rename can fail (EIO/EXDEV) — write directly
+      try { fs.writeFileSync(DB_FILE, json); } catch (e2) {
+        console.error('save direct write error', e2.message);
+      }
+      try { fs.unlinkSync(tmp); } catch (e3) {}
+    }
   } catch (e) {
     console.error('save error', e.message);
+    try { fs.writeFileSync(DB_FILE, json); } catch (e2) {
+      console.error('save fallback error', e2.message);
+    }
   }
 }
 
@@ -103,43 +118,60 @@ function save(db) {
 }
 
 function readBody(req) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const chunks = [];
     let size = 0;
+    let done = false;
     const max = 8 * 1024 * 1024;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      resolve(val || {});
+    };
     req.on('data', (c) => {
+      if (done) return;
       size += c.length;
       if (size > max) {
-        reject(new Error('body too large'));
-        req.destroy();
+        try { req.destroy(); } catch (e) {}
+        finish({ _error: 'body too large' });
         return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      const raw = buf.toString('utf8');
-      if (!raw) return resolve({});
       try {
-        resolve(JSON.parse(raw));
+        const buf = Buffer.concat(chunks);
+        const raw = buf.toString('utf8');
+        if (!raw) return finish({});
+        try {
+          finish(JSON.parse(raw));
+        } catch (e) {
+          finish({ _raw: raw.slice(0, 2000) });
+        }
       } catch (e) {
-        resolve({ _raw: raw });
+        finish({});
       }
     });
-    req.on('error', reject);
+    req.on('error', () => finish({}));
+    req.on('aborted', () => finish({}));
   });
 }
 
 function send(res, code, obj) {
-  const body = typeof obj === 'string' ? obj : JSON.stringify(obj == null ? {} : obj);
-  res.writeHead(code, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Session-Token, X-Child-Token',
-    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
-    'Cache-Control': 'no-store'
-  });
-  res.end(body);
+  try {
+    if (res.headersSent || res.writableEnded) return;
+    const body = typeof obj === 'string' ? obj : JSON.stringify(obj == null ? {} : obj);
+    res.writeHead(code, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Session-Token, X-Child-Token',
+      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+      'Cache-Control': 'no-store'
+    });
+    res.end(body);
+  } catch (e) {
+    try { res.end(); } catch (e2) {}
+  }
 }
 
 function sendHtml(res, code, html) {
@@ -171,8 +203,15 @@ function childOf(body, q, headers) {
   const db = load();
   if (t) {
     const d = db.devices.find(x => x.childToken === t || x.token === t);
-    if (d) return d;
+    if (d) {
+      // if deviceId also sent, must match same device
+      if (did && String(d.id) !== did && String(d.deviceId || '') !== did) return null;
+      return d;
+    }
+    // bad token — do not fall back to deviceId-only (prevents spoof)
+    return null;
   }
+  // legacy: deviceId only (older clients)
   if (did) {
     const d = db.devices.find(x => String(x.id) === did || String(x.deviceId) === did);
     if (d) return d;
@@ -367,7 +406,7 @@ async function handler(req, res) {
     if (pathname === '/health' || pathname === '/') {
       return send(res, 200, {
         ok: true,
-        phase: 300,
+        phase: 302,
         mode: 'slim',
         features: {
           auth: true, pair: true, commands: true,
@@ -518,35 +557,4 @@ async function handler(req, res) {
       const deviceId = String(body.deviceId || body.childId || '');
       const type = String(body.type || body.command || '');
       if (!deviceId || !type) return send(res, 400, { ok: false, error: 'deviceId + type required' });
-      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
-      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
-      const cmd = addCommand(db, dev.id, type, body.payload || body.data || body);
-      save(db);
-      return send(res, 200, { ok: true, id: cmd.id, command: cmd });
-    }
-
-    if (pathname === '/commands/pending' && method === 'GET') {
-      reclaimCommands(db);
-      const ch = childOf(body, q, req.headers);
-      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
-      markOnline(ch);
-      const did = String(ch.id || ch.deviceId);
-      // newest first, claim atomically
-      const pending = db.commands
-        .filter(c => String(c.deviceId) === did && c.status === 'PENDING')
-        .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
-        .slice(0, 30);
-      const out = [];
-      for (const c of pending) {
-        if (c.status !== 'PENDING') continue;
-        c.status = 'CLAIMED';
-        c.claimedAt = nowMs();
-        out.push({
-          id: c.id,
-          type: c.type || c.command,
-          command: c.type || c.command,
-          payload: c.payload || {},
-          createdAt: c.createdAt
-        });
-      }
-      if 
+      const dev = db.devices.
