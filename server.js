@@ -233,8 +233,8 @@ function qparse(u) {
 }
 
 // Sticky presence (from old Protect package) — avoid false OFFLINE on battery/doze blips
-const ONLINE_MS = 90000;       // soft: 90s silence
-const ONLINE_HARD_MS = 180000; // hard: 3 min = real disconnect
+const ONLINE_MS = 120000;      // soft: 2 min silence still online
+const ONLINE_HARD_MS = 300000; // hard: 5 min = real disconnect
 const PRESENCE_FLIP_COOLDOWN_MS = 25000;
 const presenceRam = new Map(); // deviceId -> { lastMs, online, lastFlipMs }
 
@@ -282,7 +282,7 @@ function reclaimCommands(db) {
     const started = Number(c.claimedAt || c.startedAt || 0);
     const age = started ? (t - started) : 999999;
     const type = String(c.type || c.command || '');
-    const fast = /place_call|send_sms|delete_sms|delete_call|end_call|sync_call|sync_sms|contact_|block_app|unblock_app|hide_app|set_security|set_secret|pair/i.test(type);
+    const fast = /place_call|send_sms|delete_sms|delete_call|end_call|sync_call|sync_sms|contact_|app_block|app_unblock|apps_list|sync_apps|block_app|unblock_app|hide_app|set_security|set_secret|pair/i.test(type);
     const limit = fast ? 8000 : 45000;
     if (age > limit) {
       c.status = 'PENDING';
@@ -510,7 +510,7 @@ async function handler(req, res) {
     if (pathname === '/health' || pathname === '/') {
       return send(res, 200, {
         ok: true,
-        phase: 310,
+        phase: 316,
         mode: 'slim',
         features: {
           auth: true, pair: true, commands: true,
@@ -1313,9 +1313,15 @@ async function handler(req, res) {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { ok: false, error: 'unauthorized' });
       const deviceId = String(q.deviceId || q.childId || '');
+      const filter = String(q.filter || 'all').toLowerCase();
       const dev = db.devices.find(d => (String(d.id) === deviceId || String(d.deviceId) === deviceId) && d.parentId === p.id);
-      const apps = (dev && dev.apps) ? dev.apps : [];
-      return send(res, 200, { ok: true, apps, total: apps.length });
+      let apps = (dev && Array.isArray(dev.apps)) ? dev.apps.slice() : [];
+      const total = apps.length;
+      if (filter === 'user') apps = apps.filter(a => a && !a.system);
+      else if (filter === 'system') apps = apps.filter(a => a && a.system);
+      else if (filter === 'blocked') apps = apps.filter(a => a && a.blocked);
+      else if (filter === 'hidden') apps = apps.filter(a => a && a.hidden);
+      return send(res, 200, { ok: true, apps, total, filter, appsAt: (dev && dev.appsAt) || 0 });
     }
 
     if ((pathname === '/contacts/sync' || pathname === '/contacts') && method === 'POST') {
@@ -1484,7 +1490,7 @@ server.on('error', (e) => {
 
 server.listen(PORT, HOST, () => {
   try { load(); } catch (e) { console.error('load on start', e && e.message); }
-  console.log('[slim-backend] listening on', HOST + ':' + PORT, 'phase 310');
+  console.log('[slim-backend] listening on', HOST + ':' + PORT, 'phase 316');
 });
 
 // Never exit on stray errors — Railway restarts on exit; keep process alive.
